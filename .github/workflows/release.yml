@@ -48,6 +48,12 @@ jobs:
       - name: Build runner
         run: ./scripts/build-runner.sh
 
+      - name: Compress artifacts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          ./scripts/compress-artifacts.sh
+
       - name: Render manifest
         run: node scripts/render-manifest.mjs
 
@@ -60,6 +66,6 @@ jobs:
           files: |
             artifacts/${{ inputs.version }}/manifest.json
             artifacts/${{ inputs.version }}/SHA256SUMS
-            artifacts/${{ inputs.version }}/vmlinux
-            artifacts/${{ inputs.version }}/rootfs.ext4
-            artifacts/${{ inputs.version }}/firecracker-runner
+            artifacts/${{ inputs.version }}/vmlinux.zst
+            artifacts/${{ inputs.version }}/rootfs.ext4.zst
+            artifacts/${{ inputs.version }}/firecracker-runner.zst

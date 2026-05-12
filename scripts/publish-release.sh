@@ -15,7 +15,7 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 1
 fi
 
-for file in manifest.json SHA256SUMS vmlinux rootfs.ext4 firecracker-runner; do
+for file in manifest.json SHA256SUMS vmlinux.zst rootfs.ext4.zst firecracker-runner.zst; do
   if [ ! -f "$artifact_dir/$file" ]; then
     echo "missing artifact: $artifact_dir/$file" >&2
     exit 1
@@ -25,8 +25,8 @@ done
 gh release create "$version" \
   "$artifact_dir/manifest.json" \
   "$artifact_dir/SHA256SUMS" \
-  "$artifact_dir/vmlinux" \
-  "$artifact_dir/rootfs.ext4" \
-  "$artifact_dir/firecracker-runner" \
+  "$artifact_dir/vmlinux.zst" \
+  "$artifact_dir/rootfs.ext4.zst" \
+  "$artifact_dir/firecracker-runner.zst" \
   --title "$version" \
   --notes "Proj Creator Firecracker runtime $version"

@@ -6,6 +6,7 @@ import { join } from "node:path";
 const version = process.env.VERSION;
 const baseUrl = process.env.BASE_URL?.replace(/\/$/, "");
 const root = process.env.ARTIFACT_ROOT ?? join("artifacts", version ?? "");
+const compression = process.env.PROJ_CREATOR_FIRECRACKER_ARTIFACT_COMPRESSION ?? "zstd";
 
 if (!version) {
   throw new Error("VERSION is required, for example VERSION=v2026.05.0");
@@ -27,16 +28,20 @@ function sha256(path) {
 }
 
 async function artifact(fileName, executable = false) {
-  const path = join(root, fileName);
+  const compressed = compression === "zstd";
+  const assetName = compressed ? `${fileName}.zst` : fileName;
+  const path = join(root, assetName);
   const size = statSync(path).size;
   if (size >= githubReleaseAssetLimitBytes) {
     throw new Error(`${fileName} is ${size} bytes; GitHub release assets must be under 2 GiB`);
   }
   return {
-    url: `${baseUrl}/${fileName}`,
+    url: `${baseUrl}/${assetName}`,
     sha256: await sha256(path),
     file_name: fileName,
+    asset_file_name: assetName,
     size_bytes: size,
+    ...(compressed ? { compression: "zstd" } : {}),
     ...(executable ? { executable: true } : {})
   };
 }
@@ -60,9 +65,9 @@ const manifest = {
 };
 
 const sums = [
-  `${manifest.kernel.sha256}  vmlinux`,
-  `${manifest.rootfs.sha256}  rootfs.ext4`,
-  `${manifest.runner.sha256}  firecracker-runner`
+  `${manifest.kernel.sha256}  ${manifest.kernel.asset_file_name}`,
+  `${manifest.rootfs.sha256}  ${manifest.rootfs.asset_file_name}`,
+  `${manifest.runner.sha256}  ${manifest.runner.asset_file_name}`
 ].join("\n") + "\n";
 
 writeFileSync(join(root, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");

@@ -13,9 +13,9 @@ Each release publishes:
 
 ```text
 manifest.json
-vmlinux
-rootfs.ext4
-firecracker-runner
+vmlinux.zst
+rootfs.ext4.zst
+firecracker-runner.zst
 SHA256SUMS
 ```
 
@@ -86,6 +86,11 @@ The published `rootfs.ext4` is a boot template, not the final per-project disk
 size. It defaults to `1800M` so it stays below GitHub Releases' per-file asset
 limit. The runner grows each per-run rootfs clone sparsely to
 `PROJ_CREATOR_FIRECRACKER_RUN_ROOTFS_SIZE` at launch time, defaulting to `50G`.
+
+Release assets are zstd-compressed before publishing. The manifest checksums
+the compressed downloads and includes `compression: "zstd"` plus the final
+installed `file_name`; worker setup verifies the compressed bytes, decompresses
+locally, and installs `vmlinux`, `rootfs.ext4`, and `firecracker-runner`.
 
 ## Security Updates
 
