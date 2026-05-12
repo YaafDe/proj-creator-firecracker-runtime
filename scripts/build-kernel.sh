@@ -8,6 +8,8 @@ arch="${PROJ_CREATOR_FIRECRACKER_ARCH:-$(uname -m)}"
 work_dir="${PROJ_CREATOR_FIRECRACKER_KERNEL_BUILD_DIR:-$repo_root/.tmp/firecracker-kernel-build}"
 out_root="${PROJ_CREATOR_FIRECRACKER_KERNEL_OUT_DIR:-$repo_root/artifacts}"
 dry_run="${PROJ_CREATOR_FIRECRACKER_KERNEL_DRY_RUN:-0}"
+skip_vmclock="${PROJ_CREATOR_FIRECRACKER_SKIP_VMCLOCK:-1}"
+patch_only="${PROJ_CREATOR_FIRECRACKER_KERNEL_PATCH_ONLY:-0}"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -28,6 +30,7 @@ require_command git
 require_command docker
 require_command sha256sum
 require_command node
+require_command python3
 
 src_dir="$work_dir/firecracker"
 version_id="${PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION:-${firecracker_ref#v}-kernel-${kernel_version}-${arch}}"
@@ -40,6 +43,7 @@ echo "Kernel version: $kernel_version"
 echo "Arch: $arch"
 echo "Build dir: $work_dir"
 echo "Output dir: $version_dir"
+echo "Skip vmclock patch/config: $skip_vmclock"
 
 if [ "$dry_run" = "1" ]; then
   echo "dry run: would clone Firecracker and run tools/devtool build_ci_artifacts kernels $kernel_version"
@@ -54,10 +58,52 @@ else
   git -C "$src_dir" fetch --depth 1 origin "$firecracker_ref"
   git -C "$src_dir" checkout --detach FETCH_HEAD
 fi
+git -C "$src_dir" reset --hard HEAD
+
+if [ "$skip_vmclock" = "1" ]; then
+  FIRECRACKER_SRC_DIR="$src_dir" python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["FIRECRACKER_SRC_DIR"]) / "resources" / "rebuild.sh"
+text = path.read_text()
+old_patch_loop = """    # Apply any patchset we have for our kernels
+    for patchset in ../patches/*; do
+        echo "Applying patchset ${patchset}/${KERNEL_VERSION}"
+        git apply ${patchset}/${KERNEL_VERSION}/*.patch
+    done
+"""
+new_patch_loop = """    # Apply any patchset we have for our kernels, unless disabled by the wrapper.
+    if [[ "${FC_SKIP_KERNEL_PATCHSETS:-0}" != "1" ]]; then
+        for patchset in ../patches/*; do
+            if ! compgen -G "${patchset}/${KERNEL_VERSION}/*.patch" >/dev/null; then
+                continue
+            fi
+            echo "Applying patchset ${patchset}/${KERNEL_VERSION}"
+            git apply ${patchset}/${KERNEL_VERSION}/*.patch
+        done
+    fi
+"""
+if old_patch_loop not in text:
+    raise SystemExit("Firecracker resources/rebuild.sh patch loop changed; update build-kernel.sh")
+text = text.replace(old_patch_loop, new_patch_loop)
+text = text.replace(' "$VMCLOCK_CONFIG"', "")
+path.write_text(text)
+PY
+fi
+
+if [ "$patch_only" = "1" ]; then
+  echo "patch only: prepared Firecracker kernel build tree"
+  exit 0
+fi
 
 (
   cd "$src_dir"
-  ./tools/devtool build_ci_artifacts kernels "$kernel_version"
+  if [ "$skip_vmclock" = "1" ]; then
+    FC_SKIP_KERNEL_PATCHSETS=1 ./tools/devtool build_ci_artifacts kernels "$kernel_version"
+  else
+    ./tools/devtool build_ci_artifacts kernels "$kernel_version"
+  fi
 )
 
 kernel_candidate="$(

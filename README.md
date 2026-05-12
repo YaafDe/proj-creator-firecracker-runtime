@@ -61,6 +61,13 @@ artifacts/<version>/vmlinux
 artifacts/<version>/kernel-artifact.json
 ```
 
+The kernel wrapper skips Firecracker's optional vmclock backport patch/config by
+default (`PROJ_CREATOR_FIRECRACKER_SKIP_VMCLOCK=1`). Firecracker v1.15.1's
+vmclock patchset no longer applies cleanly to current Amazon Linux 6.1 tags, and
+the worker runtime does not require the vmclock device. Set
+`PROJ_CREATOR_FIRECRACKER_SKIP_VMCLOCK=0` only when intentionally rebuilding
+against a kernel tag known to accept those patches.
+
 Then render the release manifest:
 
 ```bash
