@@ -15,6 +15,7 @@ jobs:
         run: |
           bash -n scripts/build-kernel.sh
           bash -n scripts/publish-release.sh
+          node scripts/resolve-release-input.mjs < /dev/null
           PROJ_CREATOR_FIRECRACKER_KERNEL_DRY_RUN=1 ./scripts/build-kernel.sh
       - name: Validate release workflow yaml
         run: test -f .github/workflows/release.yml

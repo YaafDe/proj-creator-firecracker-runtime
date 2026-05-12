@@ -1,0 +1,12 @@
+{
+  "firecracker_ref": "v1.15.1",
+  "kernel_version": "6.1",
+  "rootfs": {
+    "url": "https://example.com/proj-creator/firecracker/rootfs.ext4",
+    "sha256": "replace-with-rootfs-sha256"
+  },
+  "runner": {
+    "url": "https://example.com/proj-creator/firecracker/firecracker-runner",
+    "sha256": "replace-with-runner-sha256"
+  }
+}

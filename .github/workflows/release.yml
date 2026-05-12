@@ -7,26 +7,6 @@ on:
         description: Release version, for example v2026.05.0
         required: true
         default: v2026.05.0
-      firecracker_ref:
-        description: Firecracker git tag/ref used for the kernel build
-        required: true
-        default: v1.15.1
-      kernel_version:
-        description: Firecracker kernel artifact line
-        required: true
-        default: "6.1"
-      rootfs_url:
-        description: HTTPS URL for the prepared rootfs.ext4 artifact
-        required: true
-      rootfs_sha256:
-        description: SHA-256 for rootfs.ext4
-        required: true
-      runner_url:
-        description: HTTPS URL for the firecracker-runner artifact
-        required: true
-      runner_sha256:
-        description: SHA-256 for firecracker-runner
-        required: true
 
 permissions:
   contents: write
@@ -38,8 +18,6 @@ jobs:
       VERSION: ${{ inputs.version }}
       BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.version }}
       PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION: ${{ inputs.version }}
-      PROJ_CREATOR_FIRECRACKER_REF: ${{ inputs.firecracker_ref }}
-      PROJ_CREATOR_FIRECRACKER_KERNEL_VERSION: ${{ inputs.kernel_version }}
       PROJ_CREATOR_FIRECRACKER_KERNEL_PUBLIC_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -54,17 +32,24 @@ jobs:
               ;;
           esac
 
+      - name: Resolve runtime input
+        id: runtime
+        run: node scripts/resolve-release-input.mjs
+
       - name: Build Firecracker kernel
+        env:
+          PROJ_CREATOR_FIRECRACKER_REF: ${{ steps.runtime.outputs.firecracker_ref }}
+          PROJ_CREATOR_FIRECRACKER_KERNEL_VERSION: ${{ steps.runtime.outputs.kernel_version }}
         run: ./scripts/build-kernel.sh
 
       - name: Download rootfs and runner
         run: |
           artifact_dir="artifacts/$VERSION"
           mkdir -p "$artifact_dir"
-          curl -fL --retry 3 --output "$artifact_dir/rootfs.ext4" '${{ inputs.rootfs_url }}'
-          curl -fL --retry 3 --output "$artifact_dir/firecracker-runner" '${{ inputs.runner_url }}'
-          printf '%s  %s\n' '${{ inputs.rootfs_sha256 }}' "$artifact_dir/rootfs.ext4" | sha256sum -c -
-          printf '%s  %s\n' '${{ inputs.runner_sha256 }}' "$artifact_dir/firecracker-runner" | sha256sum -c -
+          curl -fL --retry 3 --output "$artifact_dir/rootfs.ext4" '${{ steps.runtime.outputs.rootfs_url }}'
+          curl -fL --retry 3 --output "$artifact_dir/firecracker-runner" '${{ steps.runtime.outputs.runner_url }}'
+          printf '%s  %s\n' '${{ steps.runtime.outputs.rootfs_sha256 }}' "$artifact_dir/rootfs.ext4" | sha256sum -c -
+          printf '%s  %s\n' '${{ steps.runtime.outputs.runner_sha256 }}' "$artifact_dir/firecracker-runner" | sha256sum -c -
           chmod 0755 "$artifact_dir/firecracker-runner"
 
       - name: Render manifest

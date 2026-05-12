@@ -83,11 +83,11 @@ artifacts/v2026.05.0/SHA256SUMS
 Open **Actions > release > Run workflow** and fill in:
 
 - `version`, for example `v2026.05.0`
-- `firecracker_ref`, for example `v1.15.1`
-- `kernel_version`, for example `6.1`
-- `rootfs_url` and `rootfs_sha256`
-- `runner_url` and `runner_sha256`
 
+That is the only release form input. `runtime-input.json` in this repository
+contains the Firecracker ref, kernel line, rootfs URL/hash, and runner URL/hash.
+Changing those values should be a normal code review before running a release.
+Use `runtime-input.example.json` as the template when rotating runtime sources.
 The workflow builds the kernel, downloads/verifies rootfs and runner, renders
 `manifest.json`, and publishes all release assets to GitHub Releases. The
 manifest URL for worker setup is then:
