@@ -101,12 +101,21 @@ scripts/publish-release.sh v2026.05.0
 
 This uses the GitHub CLI if authenticated locally.
 
-## Runner Status
+## Runner
 
-The current `runner/firecracker-runner` is a placeholder that exits with a clear
-error. It is enough to keep the release pipeline one-click, but it is not a
-production VM runner. Replace it with the real runner implementation before
-publishing a production runtime release.
+`runner/firecracker-runner` is the host-side VM launcher packaged into each
+release. It reads the `FirecrackerRunnerRequest` JSON from stdin, configures a
+tap device, injects an ephemeral SSH key into the per-run rootfs, starts
+Firecracker through its Unix API socket, stages the workspace into the guest,
+runs the selected agent Docker image inside the VM, syncs workspace changes
+back, and exits with the agent status.
+
+The runner expects the host to provide `docker`, `firecracker`, `ip`, `ssh`,
+`ssh-keygen`, `tar`, `mount`, `umount`, and either root privileges or
+passwordless `sudo` for the tap and loop-mount steps. It loads the selected
+agent image from the host Docker daemon into the guest with `docker save` /
+`docker load`, so the guest does not need registry access just to start the
+agent image.
 
 ## Security Rules
 

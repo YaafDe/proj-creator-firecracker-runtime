@@ -3,3 +3,4 @@ target/
 artifacts/*
 !artifacts/.gitkeep
 *.log
+__pycache__/

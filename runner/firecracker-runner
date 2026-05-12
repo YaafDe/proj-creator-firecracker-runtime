@@ -1,6 +1,315 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+import hashlib
+import http.client
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
 
-cat >/dev/null
-echo "firecracker-runner placeholder: real VM runner implementation is not bundled yet" >&2
-exit 70
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def fail(message, code=70):
+    log(f"firecracker-runner: {message}")
+    raise SystemExit(code)
+
+
+def require_command(name):
+    path = shutil.which(name)
+    if not path:
+        fail(f"required command not found: {name}")
+    return path
+
+
+def run(command, *, stdin=None, stdout=None, check=True):
+    log("+ " + shlex.join(str(part) for part in command))
+    result = subprocess.run(command, stdin=stdin, stdout=stdout, check=False)
+    if check and result.returncode != 0:
+        fail(f"command failed with exit code {result.returncode}: {shlex.join(str(part) for part in command)}")
+    return result
+
+
+def run_privileged(command, *, check=True):
+    if os.geteuid() == 0:
+        return run(command, check=check)
+    sudo = require_command("sudo")
+    return run([sudo, *command], check=check)
+
+
+class UnixHttpConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path):
+        super().__init__("localhost")
+        self.socket_path = socket_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(self.socket_path)
+
+
+def firecracker_request(api_socket, method, path, body=None):
+    conn = UnixHttpConnection(str(api_socket))
+    payload = None if body is None else json.dumps(body).encode("utf-8")
+    headers = {}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=payload, headers=headers)
+    response = conn.getresponse()
+    data = response.read().decode("utf-8", errors="replace")
+    conn.close()
+    if response.status >= 300:
+        fail(f"Firecracker API {method} {path} failed with HTTP {response.status}: {data}")
+    return data
+
+
+def wait_for_path(path, seconds, label):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if Path(path).exists():
+            return
+        time.sleep(0.1)
+    fail(f"timed out waiting for {label}: {path}")
+
+
+def wait_for_ssh(ssh_base, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        result = subprocess.run([*ssh_base, "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0:
+            return
+        time.sleep(1)
+    fail("timed out waiting for guest SSH")
+
+
+def ssh_command(ssh_base, script, *, check=True, stdout=None, stdin=None):
+    return run([*ssh_base, "bash", "-lc", shlex.quote(script)], check=check, stdout=stdout, stdin=stdin)
+
+
+def tar_to_guest(ssh_base, source, destination):
+    script = f"mkdir -p {shlex.quote(destination)} && tar -C {shlex.quote(destination)} -xf -"
+    tar = subprocess.Popen(["tar", "-C", str(source), "-cf", "-", "."], stdout=subprocess.PIPE)
+    try:
+        ssh_command(ssh_base, script, stdin=tar.stdout)
+    finally:
+        if tar.stdout:
+            tar.stdout.close()
+    status = tar.wait()
+    if status != 0:
+        fail(f"workspace tar export failed with exit code {status}")
+
+
+def tar_from_guest(ssh_base, source, destination):
+    tar = subprocess.Popen(["tar", "-C", str(destination), "-xf", "-"], stdin=subprocess.PIPE)
+    try:
+        script = f"tar --exclude=.git -C {shlex.quote(source)} -cf - ."
+        ssh_command(ssh_base, script, stdout=tar.stdin)
+    finally:
+        if tar.stdin:
+            tar.stdin.close()
+    status = tar.wait()
+    if status != 0:
+        fail(f"workspace tar import failed with exit code {status}")
+
+
+def load_docker_image_to_guest(ssh_base, image):
+    run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL)
+    save = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+    try:
+        ssh_command(ssh_base, "docker load", stdin=save.stdout)
+    finally:
+        if save.stdout:
+            save.stdout.close()
+    status = save.wait()
+    if status != 0:
+        fail(f"docker save failed with exit code {status}: {image}")
+
+
+def inject_ssh_key(rootfs, mount_dir, public_key):
+    run_privileged(["mount", "-o", "loop", str(rootfs), str(mount_dir)])
+    try:
+        for user, home, uid, gid in [
+            ("root", "root", "0", "0"),
+            ("appuser", "home/appuser", "1000", "1000"),
+        ]:
+            ssh_dir = mount_dir / home / ".ssh"
+            authorized_keys = ssh_dir / "authorized_keys"
+            run_privileged(["mkdir", "-p", str(ssh_dir)])
+            run_privileged(["sh", "-c", f"printf '%s\n' {shlex.quote(public_key)} >> {shlex.quote(str(authorized_keys))}"])
+            run_privileged(["chmod", "0700", str(ssh_dir)])
+            run_privileged(["chmod", "0600", str(authorized_keys)])
+            run_privileged(["chown", "-R", f"{uid}:{gid}", str(ssh_dir)])
+            log(f"injected SSH key for {user}")
+    finally:
+        run_privileged(["umount", str(mount_dir)], check=False)
+
+
+def stable_network(run_dir):
+    digest = hashlib.sha256(str(run_dir).encode("utf-8")).digest()
+    octet = 16 + digest[0] % 200
+    host_ip = f"172.31.{octet}.1"
+    guest_ip = f"172.31.{octet}.2"
+    mac = f"06:00:ac:1f:{octet:02x}:02"
+    tap = f"pcfc{digest[1]:02x}{digest[2]:02x}{digest[3]:02x}"[:15]
+    return tap, host_ip, guest_ip, mac
+
+
+def main():
+    request = json.load(sys.stdin)
+    rootfs = Path(request["rootfs"]).resolve()
+    kernel = Path(request["kernel_image"]).resolve()
+    run_dir = Path(request["run_dir"]).resolve()
+    repo = Path(request["repo"]).resolve()
+    workdir = request.get("workdir") or "/workspace"
+    selected_image = request["selected_image"]
+    inner_script = request["inner_script"]
+    envs = request.get("envs") or []
+
+    if not rootfs.is_file():
+        fail(f"rootfs does not exist: {rootfs}")
+    if not kernel.is_file():
+        fail(f"kernel image does not exist: {kernel}")
+    if not repo.is_dir():
+        fail(f"repo directory does not exist: {repo}")
+
+    firecracker = require_command("firecracker")
+    for command in ["docker", "ip", "ssh", "ssh-keygen", "tar", "mount", "umount"]:
+        require_command(command)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    socket_id = hashlib.sha256(str(run_dir).encode("utf-8")).hexdigest()[:16]
+    api_socket = Path(os.environ.get("TMPDIR", "/tmp")) / f"pcfc-{socket_id}.sock"
+    key_path = run_dir / "guest_ssh_key"
+    mount_dir = run_dir / "rootfs-mount"
+    log_path = run_dir / "firecracker.log"
+    metrics_path = run_dir / "firecracker-metrics.json"
+    mount_dir.mkdir(parents=True, exist_ok=True)
+    for path in [api_socket, key_path, key_path.with_suffix(".pub")]:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)])
+    public_key = key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
+    inject_ssh_key(rootfs, mount_dir, public_key)
+
+    tap, host_ip, guest_ip, mac = stable_network(run_dir)
+    firecracker_process = None
+    fc_log = None
+    exit_code = 1
+    try:
+        run_privileged(["ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", str(os.getuid())])
+        run_privileged(["ip", "addr", "add", f"{host_ip}/24", "dev", tap])
+        run_privileged(["ip", "link", "set", tap, "up"])
+
+        fc_log = log_path.open("ab")
+        firecracker_process = subprocess.Popen(
+            [firecracker, "--api-sock", str(api_socket)],
+            stdout=fc_log,
+            stderr=fc_log,
+        )
+        wait_for_path(api_socket, 10, "Firecracker API socket")
+
+        boot_args = (
+            "console=ttyS0 reboot=k panic=1 pci=off "
+            "root=/dev/vda rw init=/sbin/proj-creator-init "
+            f"ip={guest_ip}::{host_ip}:255.255.255.0::eth0:off"
+        )
+        firecracker_request(api_socket, "PUT", "/logger", {
+            "log_path": str(log_path),
+            "level": "Info",
+            "show_level": True,
+            "show_log_origin": True,
+        })
+        firecracker_request(api_socket, "PUT", "/metrics", {"metrics_path": str(metrics_path)})
+        firecracker_request(api_socket, "PUT", "/machine-config", {
+            "vcpu_count": int(os.environ.get("PROJ_CREATOR_FIRECRACKER_VCPUS", "2")),
+            "mem_size_mib": int(os.environ.get("PROJ_CREATOR_FIRECRACKER_MEM_MIB", "4096")),
+            "smt": False,
+        })
+        firecracker_request(api_socket, "PUT", "/boot-source", {
+            "kernel_image_path": str(kernel),
+            "boot_args": boot_args,
+        })
+        firecracker_request(api_socket, "PUT", "/drives/rootfs", {
+            "drive_id": "rootfs",
+            "path_on_host": str(rootfs),
+            "is_root_device": True,
+            "is_read_only": False,
+        })
+        firecracker_request(api_socket, "PUT", "/network-interfaces/eth0", {
+            "iface_id": "eth0",
+            "guest_mac": mac,
+            "host_dev_name": tap,
+        })
+        firecracker_request(api_socket, "PUT", "/actions", {"action_type": "InstanceStart"})
+
+        ssh_base = [
+            "ssh",
+            "-i", str(key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=3",
+            f"appuser@{guest_ip}",
+        ]
+        wait_for_ssh(ssh_base, 120)
+        ssh_command(
+            ssh_base,
+            "for i in $(seq 1 120); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1",
+        )
+        log(f"loading agent image into guest: {selected_image}")
+        load_docker_image_to_guest(ssh_base, selected_image)
+
+        guest_workspace = workdir if workdir.startswith("/") else f"/workspace/{workdir}"
+        log(f"staging workspace into guest {guest_workspace}")
+        tar_to_guest(ssh_base, repo, guest_workspace)
+
+        docker_args = [
+            "docker", "run", "--rm",
+            "--network", "host",
+            "-v", f"{guest_workspace}:{workdir}",
+            "-w", workdir,
+        ]
+        for key, value in envs:
+            docker_args.extend(["-e", f"{key}={value}"])
+        if request.get("extra_docker_args"):
+            docker_args.extend(shlex.split(request["extra_docker_args"]))
+        docker_args.extend([selected_image, "/bin/sh", "-lc", inner_script])
+
+        remote_script = "\n".join([
+            "set -euo pipefail",
+            shlex.join(docker_args),
+        ])
+        exit_code = ssh_command(ssh_base, remote_script, check=False).returncode
+
+        log("syncing workspace changes back from guest")
+        tar_from_guest(ssh_base, guest_workspace, repo)
+        ssh_command(ssh_base, "sudo poweroff || true", check=False)
+    finally:
+        if firecracker_process:
+            try:
+                firecracker_process.terminate()
+                firecracker_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                firecracker_process.kill()
+                firecracker_process.wait(timeout=10)
+        if fc_log:
+            fc_log.close()
+        try:
+            api_socket.unlink()
+        except FileNotFoundError:
+            pass
+        if "tap" in locals():
+            run_privileged(["ip", "link", "del", tap], check=False)
+
+    raise SystemExit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
