@@ -36,14 +36,22 @@ Do not connect this repo to the main app repo with a submodule, subtree, or
 vendored artifacts. The connection point is only the immutable release manifest
 URL. This keeps app CI fast and keeps worker setup reproducible.
 
-## Build A Kernel Artifact
+## Build Runtime Artifacts Locally
 
-The kernel build uses Firecracker's own artifact recipe through Docker.
+The release workflow does this in GitHub Actions. Local builds are mainly for
+debugging the artifact process.
 
 ```bash
+PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION=v2026.05.0 \
 PROJ_CREATOR_FIRECRACKER_REF=v1.15.1 \
 PROJ_CREATOR_FIRECRACKER_KERNEL_VERSION=6.1 \
 ./scripts/build-kernel.sh
+
+PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION=v2026.05.0 \
+./scripts/build-rootfs.sh
+
+PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION=v2026.05.0 \
+./scripts/build-runner.sh
 ```
 
 Output is written under:
@@ -51,16 +59,6 @@ Output is written under:
 ```text
 artifacts/<version>/vmlinux
 artifacts/<version>/kernel-artifact.json
-```
-
-## Assemble A Manifest
-
-Put the three runtime files in `artifacts/<version>/`:
-
-```text
-artifacts/v2026.05.0/vmlinux
-artifacts/v2026.05.0/rootfs.ext4
-artifacts/v2026.05.0/firecracker-runner
 ```
 
 Then render the release manifest:
@@ -84,12 +82,9 @@ Open **Actions > release > Run workflow** and fill in:
 
 - `version`, for example `v2026.05.0`
 
-That is the only release form input. `runtime-input.json` in this repository
-contains the Firecracker ref, kernel line, rootfs URL/hash, and runner URL/hash.
-Changing those values should be a normal code review before running a release.
-Use `runtime-input.example.json` as the template when rotating runtime sources.
-The workflow builds the kernel, downloads/verifies rootfs and runner, renders
-`manifest.json`, and publishes all release assets to GitHub Releases. The
+That is the only release form input. The workflow builds the kernel, builds the
+rootfs, packages the runner, renders `manifest.json`, and publishes all release
+assets to GitHub Releases. The
 manifest URL for worker setup is then:
 
 ```text
@@ -104,8 +99,14 @@ After reviewing artifacts locally:
 scripts/publish-release.sh v2026.05.0
 ```
 
-This uses the GitHub CLI if authenticated locally. GitHub Actions can be added
-later to run the same scripts when the rootfs and runner builds are automated.
+This uses the GitHub CLI if authenticated locally.
+
+## Runner Status
+
+The current `runner/firecracker-runner` is a placeholder that exits with a clear
+error. It is enough to keep the release pipeline one-click, but it is not a
+production VM runner. Replace it with the real runner implementation before
+publishing a production runtime release.
 
 ## Security Rules
 

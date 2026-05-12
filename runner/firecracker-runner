@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cat >/dev/null
+echo "firecracker-runner placeholder: real VM runner implementation is not bundled yet" >&2
+exit 70

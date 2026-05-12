@@ -32,25 +32,14 @@ jobs:
               ;;
           esac
 
-      - name: Resolve runtime input
-        id: runtime
-        run: node scripts/resolve-release-input.mjs
-
       - name: Build Firecracker kernel
-        env:
-          PROJ_CREATOR_FIRECRACKER_REF: ${{ steps.runtime.outputs.firecracker_ref }}
-          PROJ_CREATOR_FIRECRACKER_KERNEL_VERSION: ${{ steps.runtime.outputs.kernel_version }}
         run: ./scripts/build-kernel.sh
 
-      - name: Download rootfs and runner
-        run: |
-          artifact_dir="artifacts/$VERSION"
-          mkdir -p "$artifact_dir"
-          curl -fL --retry 3 --output "$artifact_dir/rootfs.ext4" '${{ steps.runtime.outputs.rootfs_url }}'
-          curl -fL --retry 3 --output "$artifact_dir/firecracker-runner" '${{ steps.runtime.outputs.runner_url }}'
-          printf '%s  %s\n' '${{ steps.runtime.outputs.rootfs_sha256 }}' "$artifact_dir/rootfs.ext4" | sha256sum -c -
-          printf '%s  %s\n' '${{ steps.runtime.outputs.runner_sha256 }}' "$artifact_dir/firecracker-runner" | sha256sum -c -
-          chmod 0755 "$artifact_dir/firecracker-runner"
+      - name: Build rootfs
+        run: ./scripts/build-rootfs.sh
+
+      - name: Build runner
+        run: ./scripts/build-runner.sh
 
       - name: Render manifest
         run: node scripts/render-manifest.mjs

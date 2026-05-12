@@ -14,8 +14,11 @@ jobs:
       - name: Validate scripts
         run: |
           bash -n scripts/build-kernel.sh
+          bash -n scripts/build-rootfs.sh
+          bash -n scripts/build-runner.sh
           bash -n scripts/publish-release.sh
-          node scripts/resolve-release-input.mjs < /dev/null
           PROJ_CREATOR_FIRECRACKER_KERNEL_DRY_RUN=1 ./scripts/build-kernel.sh
+          PROJ_CREATOR_FIRECRACKER_ROOTFS_DRY_RUN=1 ./scripts/build-rootfs.sh
+          PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION=vvalidate ./scripts/build-runner.sh
       - name: Validate release workflow yaml
         run: test -f .github/workflows/release.yml
