@@ -130,6 +130,30 @@ def load_docker_image_to_guest(ssh_base, image):
         fail(f"docker save failed with exit code {status}: {image}")
 
 
+def parse_size(value):
+    value = value.strip()
+    if not value:
+        fail("empty rootfs size")
+    suffix = value[-1].upper()
+    multipliers = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+    if suffix in multipliers:
+        return int(float(value[:-1]) * multipliers[suffix])
+    return int(value)
+
+
+def grow_rootfs(rootfs):
+    target_size = os.environ.get("PROJ_CREATOR_FIRECRACKER_RUN_ROOTFS_SIZE", "50G")
+    target_bytes = parse_size(target_size)
+    current_bytes = rootfs.stat().st_size
+    if current_bytes >= target_bytes:
+        log(f"rootfs already {current_bytes} bytes; target is {target_size}")
+        return
+    log(f"growing run rootfs from {current_bytes} bytes to {target_size}")
+    run(["truncate", "-s", target_size, str(rootfs)])
+    run(["e2fsck", "-fy", str(rootfs)])
+    run(["resize2fs", str(rootfs)])
+
+
 def inject_ssh_key(rootfs, mount_dir, public_key):
     run_privileged(["mount", "-o", "loop", str(rootfs), str(mount_dir)])
     try:
@@ -178,7 +202,7 @@ def main():
         fail(f"repo directory does not exist: {repo}")
 
     firecracker = require_command("firecracker")
-    for command in ["docker", "ip", "ssh", "ssh-keygen", "tar", "mount", "umount"]:
+    for command in ["docker", "e2fsck", "ip", "resize2fs", "ssh", "ssh-keygen", "tar", "truncate", "mount", "umount"]:
         require_command(command)
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -195,6 +219,7 @@ def main():
         except FileNotFoundError:
             pass
 
+    grow_rootfs(rootfs)
     run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)])
     public_key = key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
     inject_ssh_key(rootfs, mount_dir, public_key)

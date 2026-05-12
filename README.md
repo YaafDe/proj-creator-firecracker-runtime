@@ -82,6 +82,11 @@ default (`PROJ_CREATOR_FIRECRACKER_SKIP_VMCLOCK=1`) because current Amazon
 Linux 6.1 tags no longer accept Firecracker v1.15.1's vmclock backport patchset,
 and this worker runtime does not require the vmclock device.
 
+The published `rootfs.ext4` is a boot template, not the final per-project disk
+size. It defaults to `1800M` so it stays below GitHub Releases' per-file asset
+limit. The runner grows each per-run rootfs clone sparsely to
+`PROJ_CREATOR_FIRECRACKER_RUN_ROOTFS_SIZE` at launch time, defaulting to `50G`.
+
 ## Security Updates
 
 Kernel and rootfs security updates are handled by cutting a new runtime release.

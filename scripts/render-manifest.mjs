@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const version = process.env.VERSION;
@@ -14,22 +14,35 @@ if (!baseUrl) {
   throw new Error("BASE_URL is required, for example BASE_URL=https://github.com/ORG/repo/releases/download/v2026.05.0");
 }
 
+const githubReleaseAssetLimitBytes = 2 * 1024 * 1024 * 1024;
+
 function sha256(path) {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("data", chunk => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
 }
 
-function artifact(fileName, executable = false) {
+async function artifact(fileName, executable = false) {
   const path = join(root, fileName);
+  const size = statSync(path).size;
+  if (size >= githubReleaseAssetLimitBytes) {
+    throw new Error(`${fileName} is ${size} bytes; GitHub release assets must be under 2 GiB`);
+  }
   return {
     url: `${baseUrl}/${fileName}`,
-    sha256: sha256(path),
+    sha256: await sha256(path),
     file_name: fileName,
+    size_bytes: size,
     ...(executable ? { executable: true } : {})
   };
 }
 
-function kernelArtifact() {
-  const kernel = artifact("vmlinux");
+async function kernelArtifact() {
+  const kernel = await artifact("vmlinux");
   const fragmentPath = join(root, "kernel-artifact.json");
   if (!existsSync(fragmentPath)) return kernel;
   const fragment = JSON.parse(readFileSync(fragmentPath, "utf8"));
@@ -41,9 +54,9 @@ function kernelArtifact() {
 
 const manifest = {
   version,
-  kernel: kernelArtifact(),
-  rootfs: artifact("rootfs.ext4"),
-  runner: artifact("firecracker-runner", true)
+  kernel: await kernelArtifact(),
+  rootfs: await artifact("rootfs.ext4"),
+  runner: await artifact("firecracker-runner", true)
 };
 
 const sums = [

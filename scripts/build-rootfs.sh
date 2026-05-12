@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 version="${PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION:-vdev}"
-rootfs_size="${PROJ_CREATOR_FIRECRACKER_ROOTFS_SIZE:-8G}"
+rootfs_size="${PROJ_CREATOR_FIRECRACKER_ROOTFS_SIZE:-1800M}"
 artifact_dir="${PROJ_CREATOR_FIRECRACKER_ARTIFACT_DIR:-$repo_root/artifacts/$version}"
 image_name="${PROJ_CREATOR_FIRECRACKER_ROOTFS_IMAGE:-proj-creator-firecracker-rootfs:$version}"
 work_dir="${PROJ_CREATOR_FIRECRACKER_ROOTFS_BUILD_DIR:-$repo_root/.tmp/rootfs-build-$version}"
@@ -17,7 +17,7 @@ require_command() {
 }
 
 if [ "$dry_run" = "1" ]; then
-  echo "dry run: would build Docker rootfs image and export ext4 rootfs $artifact_dir/rootfs.ext4"
+  echo "dry run: would build Docker rootfs image and export $rootfs_size ext4 rootfs $artifact_dir/rootfs.ext4"
   exit 0
 fi
 
