@@ -91,15 +91,12 @@ consumes immutable release manifest URLs, so updating an existing worker fleet
 means publishing a fresh runtime version and running `install-worker` with the
 new manifest URL.
 
-For urgent kernel CVEs, either run the release workflow after Ubuntu publishes a
-fixed Noble kernel tag, or pin `PROJ_CREATOR_UBUNTU_KERNEL_TAG` to the fixed tag
-in a reviewed commit and release that version. Do not mutate assets under an
+For urgent kernel CVEs, run the normal **Actions > release > Run workflow**
+after Ubuntu publishes a fixed Noble kernel tag and choose a fresh version such
+as `v2026.05.12-security.1`. If you need a specific fixed tag, pin
+`PROJ_CREATOR_UBUNTU_KERNEL_TAG` in `scripts/build-kernel.sh` through a reviewed
+commit before running the same release workflow. Do not mutate assets under an
 existing release tag.
-
-For a no-input rebuild, run **Actions > security-refresh > Run workflow**. It
-creates a dated version like `v2026.05.12-security.123`, rebuilds the Ubuntu
-kernel/rootfs/runner, and publishes a normal GitHub release with a fresh
-manifest URL.
 
 Then render the release manifest:
 

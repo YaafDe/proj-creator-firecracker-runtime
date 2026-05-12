@@ -19,6 +19,7 @@ jobs:
       BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.version }}
       PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION: ${{ inputs.version }}
       PROJ_CREATOR_FIRECRACKER_KERNEL_PUBLIC_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.version }}
+      PROJ_CREATOR_FIRECRACKER_KERNEL_PROVIDER: ubuntu
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +33,13 @@ jobs:
               ;;
           esac
 
-      - name: Build Firecracker kernel
+      - name: Show release context
+        run: |
+          echo "release version: $VERSION"
+          echo "git sha: $GITHUB_SHA"
+          echo "kernel provider: $PROJ_CREATOR_FIRECRACKER_KERNEL_PROVIDER"
+
+      - name: Build Ubuntu guest kernel
         run: ./scripts/build-kernel.sh
 
       - name: Build rootfs
