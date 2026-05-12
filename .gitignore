@@ -1,0 +1,5 @@
+.tmp/
+target/
+artifacts/*
+!artifacts/.gitkeep
+*.log
