@@ -78,7 +78,25 @@ artifacts/v2026.05.0/manifest.json
 artifacts/v2026.05.0/SHA256SUMS
 ```
 
-## Publish
+## One-Click Release In GitHub Actions
+
+Open **Actions > release > Run workflow** and fill in:
+
+- `version`, for example `v2026.05.0`
+- `firecracker_ref`, for example `v1.15.1`
+- `kernel_version`, for example `6.1`
+- `rootfs_url` and `rootfs_sha256`
+- `runner_url` and `runner_sha256`
+
+The workflow builds the kernel, downloads/verifies rootfs and runner, renders
+`manifest.json`, and publishes all release assets to GitHub Releases. The
+manifest URL for worker setup is then:
+
+```text
+https://github.com/YaafDe/proj-creator-firecracker-runtime/releases/download/<version>/manifest.json
+```
+
+## Publish From A Local Machine
 
 After reviewing artifacts locally:
 

@@ -1,0 +1,84 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example v2026.05.0
+        required: true
+        default: v2026.05.0
+      firecracker_ref:
+        description: Firecracker git tag/ref used for the kernel build
+        required: true
+        default: v1.15.1
+      kernel_version:
+        description: Firecracker kernel artifact line
+        required: true
+        default: "6.1"
+      rootfs_url:
+        description: HTTPS URL for the prepared rootfs.ext4 artifact
+        required: true
+      rootfs_sha256:
+        description: SHA-256 for rootfs.ext4
+        required: true
+      runner_url:
+        description: HTTPS URL for the firecracker-runner artifact
+        required: true
+      runner_sha256:
+        description: SHA-256 for firecracker-runner
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.version }}
+      PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION: ${{ inputs.version }}
+      PROJ_CREATOR_FIRECRACKER_REF: ${{ inputs.firecracker_ref }}
+      PROJ_CREATOR_FIRECRACKER_KERNEL_VERSION: ${{ inputs.kernel_version }}
+      PROJ_CREATOR_FIRECRACKER_KERNEL_PUBLIC_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version
+        run: |
+          case "$VERSION" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "version must look like v2026.05.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Build Firecracker kernel
+        run: ./scripts/build-kernel.sh
+
+      - name: Download rootfs and runner
+        run: |
+          artifact_dir="artifacts/$VERSION"
+          mkdir -p "$artifact_dir"
+          curl -fL --retry 3 --output "$artifact_dir/rootfs.ext4" '${{ inputs.rootfs_url }}'
+          curl -fL --retry 3 --output "$artifact_dir/firecracker-runner" '${{ inputs.runner_url }}'
+          printf '%s  %s\n' '${{ inputs.rootfs_sha256 }}' "$artifact_dir/rootfs.ext4" | sha256sum -c -
+          printf '%s  %s\n' '${{ inputs.runner_sha256 }}' "$artifact_dir/firecracker-runner" | sha256sum -c -
+          chmod 0755 "$artifact_dir/firecracker-runner"
+
+      - name: Render manifest
+        run: node scripts/render-manifest.mjs
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          generate_release_notes: false
+          files: |
+            artifacts/${{ inputs.version }}/manifest.json
+            artifacts/${{ inputs.version }}/SHA256SUMS
+            artifacts/${{ inputs.version }}/vmlinux
+            artifacts/${{ inputs.version }}/rootfs.ext4
+            artifacts/${{ inputs.version }}/firecracker-runner
