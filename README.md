@@ -42,10 +42,7 @@ The release workflow does this in GitHub Actions. Local builds are mainly for
 debugging the artifact process.
 
 ```bash
-PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION=v2026.05.0 \
-PROJ_CREATOR_FIRECRACKER_REF=v1.15.1 \
-PROJ_CREATOR_FIRECRACKER_KERNEL_VERSION=6.1 \
-./scripts/build-kernel.sh
+PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION=v2026.05.0 ./scripts/build-kernel.sh
 
 PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION=v2026.05.0 \
 ./scripts/build-rootfs.sh
@@ -61,12 +58,48 @@ artifacts/<version>/vmlinux
 artifacts/<version>/kernel-artifact.json
 ```
 
-The kernel wrapper skips Firecracker's optional vmclock backport patch/config by
-default (`PROJ_CREATOR_FIRECRACKER_SKIP_VMCLOCK=1`). Firecracker v1.15.1's
-vmclock patchset no longer applies cleanly to current Amazon Linux 6.1 tags, and
-the worker runtime does not require the vmclock device. Set
-`PROJ_CREATOR_FIRECRACKER_SKIP_VMCLOCK=0` only when intentionally rebuilding
-against a kernel tag known to accept those patches.
+The default kernel provider is `ubuntu`. It builds an uncompressed Firecracker
+`vmlinux` from the latest Ubuntu Noble 6.8 kernel source tag matching
+`Ubuntu-6.8.0-*`, using Firecracker's guest kernel config as the microVM boot
+profile. The exact Ubuntu tag is recorded in `kernel-artifact.json` and copied
+into the published release manifest.
+
+To pin or override the kernel source:
+
+```bash
+PROJ_CREATOR_UBUNTU_KERNEL_TAG=Ubuntu-6.8.0-119.119 ./scripts/build-kernel.sh
+```
+
+Firecracker's Amazon Linux CI kernel recipe remains available only as a
+fallback:
+
+```bash
+PROJ_CREATOR_FIRECRACKER_KERNEL_PROVIDER=firecracker-ci ./scripts/build-kernel.sh
+```
+
+That fallback skips Firecracker's optional vmclock backport patch/config by
+default (`PROJ_CREATOR_FIRECRACKER_SKIP_VMCLOCK=1`) because current Amazon
+Linux 6.1 tags no longer accept Firecracker v1.15.1's vmclock backport patchset,
+and this worker runtime does not require the vmclock device.
+
+## Security Updates
+
+Kernel and rootfs security updates are handled by cutting a new runtime release.
+Each release rebuilds the rootfs from Ubuntu 24.04 packages and, by default,
+resolves the latest matching Ubuntu Noble kernel tag at build time. Worker setup
+consumes immutable release manifest URLs, so updating an existing worker fleet
+means publishing a fresh runtime version and running `install-worker` with the
+new manifest URL.
+
+For urgent kernel CVEs, either run the release workflow after Ubuntu publishes a
+fixed Noble kernel tag, or pin `PROJ_CREATOR_UBUNTU_KERNEL_TAG` to the fixed tag
+in a reviewed commit and release that version. Do not mutate assets under an
+existing release tag.
+
+For a no-input rebuild, run **Actions > security-refresh > Run workflow**. It
+creates a dated version like `v2026.05.12-security.123`, rebuilds the Ubuntu
+kernel/rootfs/runner, and publishes a normal GitHub release with a fresh
+manifest URL.
 
 Then render the release manifest:
 

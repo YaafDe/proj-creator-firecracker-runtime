@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const version = process.env.VERSION;
@@ -28,9 +28,20 @@ function artifact(fileName, executable = false) {
   };
 }
 
+function kernelArtifact() {
+  const kernel = artifact("vmlinux");
+  const fragmentPath = join(root, "kernel-artifact.json");
+  if (!existsSync(fragmentPath)) return kernel;
+  const fragment = JSON.parse(readFileSync(fragmentPath, "utf8"));
+  if (fragment?.kernel?.source) {
+    kernel.source = fragment.kernel.source;
+  }
+  return kernel;
+}
+
 const manifest = {
   version,
-  kernel: artifact("vmlinux"),
+  kernel: kernelArtifact(),
   rootfs: artifact("rootfs.ext4"),
   runner: artifact("firecracker-runner", true)
 };
