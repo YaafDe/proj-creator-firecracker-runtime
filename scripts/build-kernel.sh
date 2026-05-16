@@ -74,6 +74,22 @@ clone_firecracker_config_source() {
   echo "$src_dir"
 }
 
+ensure_microvm_kernel_config() {
+  local linux_src="$1"
+  (
+    cd "$linux_src"
+    scripts/config \
+      --enable VIRTIO \
+      --enable VIRTIO_BLK \
+      --enable VIRTIO_NET \
+      --enable VIRTIO_MMIO \
+      --enable VIRTIO_MMIO_CMDLINE_DEVICES \
+      --enable EXT4_FS \
+      --enable DEVTMPFS \
+      --enable DEVTMPFS_MOUNT
+  )
+}
+
 write_kernel_manifest() {
   local source_name="$1"
   local source_ref="$2"
@@ -155,6 +171,7 @@ build_ubuntu_kernel() {
   fi
   git -C "$ubuntu_src" reset --hard HEAD >/dev/null
   cp "$config_path" "$ubuntu_src/.config"
+  ensure_microvm_kernel_config "$ubuntu_src"
 
   if [ "$patch_only" = "1" ]; then
     echo "patch only: prepared Ubuntu kernel source and Firecracker guest config"
@@ -173,7 +190,9 @@ build_ubuntu_kernel() {
       apt-get install -y --no-install-recommends \
         bc bison build-essential ca-certificates dwarves flex git libelf-dev libssl-dev rsync
       make ARCH=x86_64 olddefconfig
+      grep -q "^CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y$" .config
       make ARCH=x86_64 -j"$(nproc)" vmlinux
+      strings vmlinux | grep -q "virtio_mmio.device"
       install -m 0644 vmlinux /out/vmlinux
     '
 

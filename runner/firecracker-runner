@@ -3,11 +3,14 @@ import hashlib
 import http.client
 import json
 import os
+import re
+import select
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,11 +31,30 @@ def require_command(name):
     return path
 
 
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?P<key>(?:[A-Za-z_][A-Za-z0-9_]*(?:_TOKEN|_KEY|_SECRET|_PASSWORD|_PASS|_CREDENTIAL|_CREDENTIALS)|PROMPT_B64|CODEX_RESUME_FALLBACK_PROMPT_B64))="
+    r"(?P<value>'[^']*'|\"[^\"]*\"|[^\s'\";]+)"
+)
+BEARER_TOKEN_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
+
+
+def redact_sensitive_text(value):
+    value = SENSITIVE_ASSIGNMENT_RE.sub(lambda match: f"{match.group('key')}=<redacted>", value)
+    return BEARER_TOKEN_RE.sub(r"\1<redacted>", value)
+
+
+def format_command(command):
+    parts = [str(part) for part in command]
+    if len(parts) >= 3 and Path(parts[0]).name == "ssh" and parts[-3:-1] == ["bash", "-lc"]:
+        parts = [*parts[:-1], "<remote-script>"]
+    return redact_sensitive_text(shlex.join(parts))
+
+
 def run(command, *, stdin=None, stdout=None, check=True):
-    log("+ " + shlex.join(str(part) for part in command))
+    log("+ " + format_command(command))
     result = subprocess.run(command, stdin=stdin, stdout=stdout, check=False)
     if check and result.returncode != 0:
-        fail(f"command failed with exit code {result.returncode}: {shlex.join(str(part) for part in command)}")
+        fail(f"command failed with exit code {result.returncode}: {format_command(command)}")
     return result
 
 
@@ -154,13 +176,27 @@ def grow_rootfs(rootfs):
     run(["resize2fs", str(rootfs)])
 
 
+def rootfs_user_ids(mount_dir, user):
+    passwd_path = mount_dir / "etc" / "passwd"
+    try:
+        with passwd_path.open("r", encoding="utf-8") as passwd:
+            for line in passwd:
+                fields = line.rstrip("\n").split(":")
+                if len(fields) >= 4 and fields[0] == user:
+                    return fields[2], fields[3]
+    except OSError as err:
+        fail(f"failed to read guest passwd database {passwd_path}: {err}")
+    fail(f"guest user not found in {passwd_path}: {user}")
+
+
 def inject_ssh_key(rootfs, mount_dir, public_key):
     run_privileged(["mount", "-o", "loop", str(rootfs), str(mount_dir)])
     try:
-        for user, home, uid, gid in [
-            ("root", "root", "0", "0"),
-            ("appuser", "home/appuser", "1000", "1000"),
+        for user, home in [
+            ("root", "root"),
+            ("appuser", "home/appuser"),
         ]:
+            uid, gid = rootfs_user_ids(mount_dir, user)
             ssh_dir = mount_dir / home / ".ssh"
             authorized_keys = ssh_dir / "authorized_keys"
             run_privileged(["mkdir", "-p", str(ssh_dir)])
@@ -181,6 +217,139 @@ def stable_network(run_dir):
     mac = f"06:00:ac:1f:{octet:02x}:02"
     tap = f"pcfc{digest[1]:02x}{digest[2]:02x}{digest[3]:02x}"[:15]
     return tap, host_ip, guest_ip, mac
+
+
+LOCAL_URL_RE = re.compile(
+    r"http://(?P<host>127\.0\.0\.1|localhost|host\.docker\.internal|172\.17\.0\.1)(?P<port>:\d+)?"
+)
+
+BASE64_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{32,}={0,2})(?![A-Za-z0-9+/=])")
+
+
+def rewrite_local_urls(value, gateway_ip):
+    return LOCAL_URL_RE.sub(lambda match: f"http://{gateway_ip}{match.group('port') or ''}", value)
+
+
+def rewrite_base64_local_urls(value, gateway_ip):
+    def replace(match):
+        token = match.group(1)
+        padded = token + ("=" * ((4 - len(token) % 4) % 4))
+        try:
+            decoded = base64_decode(padded)
+        except ValueError:
+            return token
+        rewritten = rewrite_local_urls(decoded, gateway_ip)
+        if rewritten == decoded:
+            return token
+        return base64_encode(rewritten)
+
+    return BASE64_TOKEN_RE.sub(replace, value)
+
+
+def base64_decode(value):
+    import base64
+
+    try:
+        decoded = base64.b64decode(value, validate=True)
+        text = decoded.decode("utf-8")
+    except Exception as err:
+        raise ValueError(str(err)) from err
+    if "\x00" in text:
+        raise ValueError("decoded token contains NUL")
+    return text
+
+
+def base64_encode(value):
+    import base64
+
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def rewrite_guest_connectivity(value, gateway_ip):
+    return rewrite_base64_local_urls(rewrite_local_urls(value, gateway_ip), gateway_ip)
+
+
+def collect_local_url_ports(value):
+    ports = set()
+
+    def collect_from_text(text):
+        for match in LOCAL_URL_RE.finditer(text):
+            port = match.group("port")
+            ports.add(int(port[1:]) if port else 80)
+
+    collect_from_text(value)
+    for match in BASE64_TOKEN_RE.finditer(value):
+        token = match.group(1)
+        padded = token + ("=" * ((4 - len(token) % 4) % 4))
+        try:
+            collect_from_text(base64_decode(padded))
+        except ValueError:
+            continue
+    return ports
+
+
+def pipe_bidirectional(client, upstream):
+    sockets = [client, upstream]
+    try:
+        while sockets:
+            readable, _, _ = select.select(sockets, [], [], 30)
+            if not readable:
+                return
+            for source in readable:
+                data = source.recv(65536)
+                if not data:
+                    return
+                target = upstream if source is client else client
+                target.sendall(data)
+    except OSError:
+        return
+    finally:
+        for sock in (client, upstream):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def start_loopback_proxy(bind_host, port):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listener.bind((bind_host, port))
+        listener.listen(64)
+    except OSError as err:
+        listener.close()
+        log(f"loopback proxy skipped for {bind_host}:{port}: {err}")
+        return None
+
+    stop = threading.Event()
+
+    def accept_loop():
+        while not stop.is_set():
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                upstream = socket.create_connection(("127.0.0.1", port), timeout=10)
+            except OSError as err:
+                log(f"loopback proxy failed to connect 127.0.0.1:{port}: {err}")
+                client.close()
+                continue
+            threading.Thread(target=pipe_bidirectional, args=(client, upstream), daemon=True).start()
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+    log(f"loopback proxy listening on {bind_host}:{port} -> 127.0.0.1:{port}")
+    return listener, stop
+
+
+def stop_loopback_proxies(proxies):
+    for listener, stop in proxies:
+        stop.set()
+        try:
+            listener.close()
+        except OSError:
+            pass
 
 
 def main():
@@ -225,13 +394,23 @@ def main():
     inject_ssh_key(rootfs, mount_dir, public_key)
 
     tap, host_ip, guest_ip, mac = stable_network(run_dir)
+    local_proxy_ports = collect_local_url_ports(inner_script)
+    for _, value in envs:
+        local_proxy_ports.update(collect_local_url_ports(str(value)))
+    inner_script = rewrite_guest_connectivity(inner_script, host_ip)
+    envs = [(key, rewrite_guest_connectivity(str(value), host_ip)) for key, value in envs]
     firecracker_process = None
     fc_log = None
+    loopback_proxies = []
     exit_code = 1
     try:
         run_privileged(["ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", str(os.getuid())])
         run_privileged(["ip", "addr", "add", f"{host_ip}/24", "dev", tap])
         run_privileged(["ip", "link", "set", tap, "up"])
+        for port in sorted(local_proxy_ports):
+            proxy = start_loopback_proxy(host_ip, port)
+            if proxy is not None:
+                loopback_proxies.append(proxy)
 
         fc_log = log_path.open("ab")
         firecracker_process = subprocess.Popen(
@@ -295,8 +474,11 @@ def main():
         log(f"staging workspace into guest {guest_workspace}")
         tar_to_guest(ssh_base, repo, guest_workspace)
 
+        container_suffix = re.sub(r"[^a-zA-Z0-9_.-]", "-", str(request.get("message_id") or "run"))[:48]
+        agent_container_name = f"proj-creator-agent-{container_suffix}"
         docker_args = [
-            "docker", "run", "--rm",
+            "docker", "run",
+            "--name", agent_container_name,
             "--network", "host",
             "-v", f"{guest_workspace}:{workdir}",
             "-w", workdir,
@@ -305,25 +487,67 @@ def main():
             docker_args.extend(["-e", f"{key}={value}"])
         if request.get("extra_docker_args"):
             docker_args.extend(shlex.split(request["extra_docker_args"]))
-        docker_args.extend([selected_image, "/bin/sh", "-lc", inner_script])
+        docker_args.extend([selected_image, "/bin/bash", "-lc", inner_script])
 
+        container_name_q = shlex.quote(agent_container_name)
         remote_script = "\n".join([
-            "set -euo pipefail",
+            "set -uo pipefail",
+            f"docker rm -f {container_name_q} >/dev/null 2>&1 || true",
             shlex.join(docker_args),
+            "agent_status=$?",
+            "codex_marker_status=",
+            f"for _ in $(seq 1 20); do "
+            f"codex_marker_status=$(docker logs {container_name_q} 2>&1 | sed -n 's/^codex_exit_status=//p' | tail -n 1 || true); "
+            "[ -n \"$codex_marker_status\" ] && break; "
+            "sleep 0.1; "
+            "done",
+            f"container_status=$(docker inspect --format '{{{{.State.ExitCode}}}}' {container_name_q} 2>/dev/null || true)",
+            "case \"$codex_marker_status\" in "
+            "''|*[!0-9]* ) "
+            "if [ -n \"$container_status\" ]; then agent_status=\"$container_status\"; fi ;; "
+            "* ) "
+            "if [ \"$agent_status\" -ne \"$codex_marker_status\" ] || [ \"$container_status\" != \"$codex_marker_status\" ]; then "
+            "printf '%s\\n' \"guest container status differed from Codex marker; using Codex marker: docker=${agent_status} container=${container_status:-unknown} codex=${codex_marker_status}\" >&2; "
+            "fi; "
+            "agent_status=\"$codex_marker_status\" ;; "
+            "esac",
+            "if [ \"$agent_status\" -ne 0 ]; then "
+            "printf '%s\\n' \"guest docker run exited with code ${agent_status}\" >&2; "
+            "if [ -n \"$container_status\" ]; then printf '%s\\n' \"guest container state exit code ${container_status}\" >&2; fi; "
+            "fi",
+            f"docker rm -f {container_name_q} >/dev/null 2>&1 || true",
+            "exit \"$agent_status\"",
         ])
         exit_code = ssh_command(ssh_base, remote_script, check=False).returncode
+        log(f"guest agent command exited with code {exit_code}")
 
         log("syncing workspace changes back from guest")
         tar_from_guest(ssh_base, guest_workspace, repo)
-        ssh_command(ssh_base, "sudo poweroff || true", check=False)
+        root_ssh_base = [
+            "ssh",
+            "-i", str(key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=3",
+            f"root@{guest_ip}",
+        ]
+        shutdown_script = (
+            "python3 -c 'import ctypes, os; os.sync(); "
+            "ctypes.CDLL(None).reboot(0x4321fedc)' "
+            "|| poweroff || shutdown -h now || halt -f || true"
+        )
+        run(["timeout", "8", *root_ssh_base, "bash", "-lc", shlex.quote(shutdown_script)], check=False)
     finally:
         if firecracker_process:
             try:
                 firecracker_process.terminate()
-                firecracker_process.wait(timeout=10)
+                vm_status = firecracker_process.wait(timeout=10)
+                log(f"firecracker process exited with code {vm_status}")
             except subprocess.TimeoutExpired:
+                log("firecracker process did not exit after terminate; killing")
                 firecracker_process.kill()
-                firecracker_process.wait(timeout=10)
+                vm_status = firecracker_process.wait(timeout=10)
+                log(f"firecracker process killed with code {vm_status}")
         if fc_log:
             fc_log.close()
         try:
@@ -332,6 +556,7 @@ def main():
             pass
         if "tap" in locals():
             run_privileged(["ip", "link", "del", tap], check=False)
+        stop_loopback_proxies(loopback_proxies)
 
     raise SystemExit(exit_code)
 

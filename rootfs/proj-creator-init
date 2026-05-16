@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 mount -t proc proc /proc 2>/dev/null || true
 mount -t sysfs sysfs /sys 2>/dev/null || true
@@ -8,6 +9,7 @@ mkdir -p /sys/fs/cgroup
 mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
 mount -t tmpfs tmpfs /run 2>/dev/null || true
 mkdir -p /run/sshd /workspace /var/lib/proj-creator
+chown appuser:appuser /workspace /var/lib/proj-creator 2>/dev/null || true
 
 ip link set lo up 2>/dev/null || true
 ip link set eth0 up 2>/dev/null || true
@@ -16,12 +18,23 @@ if [ -x /usr/sbin/sshd ]; then
   ssh-keygen -A >/dev/null 2>&1 || true
 fi
 
+if [ -x /usr/bin/containerd ]; then
+  mkdir -p /run/containerd
+  /usr/bin/containerd >/var/log/proj-creator-containerd.log 2>&1 &
+  for _ in $(seq 1 100); do
+    [ -S /run/containerd/containerd.sock ] && break
+    sleep 0.1
+  done
+fi
+
 if [ -x /usr/bin/dockerd ]; then
   mkdir -p /var/lib/docker
   /usr/bin/dockerd \
     --host=unix:///var/run/docker.sock \
+    --containerd=/run/containerd/containerd.sock \
     --iptables=false \
     --bridge=none \
+    --userland-proxy=false \
     >/var/log/proj-creator-dockerd.log 2>&1 &
 fi
 
