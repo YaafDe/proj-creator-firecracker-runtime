@@ -64,6 +64,12 @@ The default kernel provider is `ubuntu`. It builds an uncompressed Firecracker
 profile. The exact Ubuntu tag is recorded in `kernel-artifact.json` and copied
 into the published release manifest.
 
+The build forces the virtio-mmio command-line transport options required by the
+runner. Firecracker appends `virtio_mmio.device=...` boot arguments for the
+rootfs block device and network device, so release kernels must contain
+`CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` and the built `vmlinux` must contain the
+`virtio_mmio.device` parser string.
+
 To pin or override the kernel source:
 
 ```bash
