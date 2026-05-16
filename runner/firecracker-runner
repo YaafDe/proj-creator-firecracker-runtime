@@ -31,11 +31,30 @@ def require_command(name):
     return path
 
 
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?P<key>(?:[A-Za-z_][A-Za-z0-9_]*(?:_TOKEN|_KEY|_SECRET|_PASSWORD|_PASS|_CREDENTIAL|_CREDENTIALS)|PROMPT_B64|CODEX_RESUME_FALLBACK_PROMPT_B64))="
+    r"(?P<value>'[^']*'|\"[^\"]*\"|[^\s'\";]+)"
+)
+BEARER_TOKEN_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
+
+
+def redact_sensitive_text(value):
+    value = SENSITIVE_ASSIGNMENT_RE.sub(lambda match: f"{match.group('key')}=<redacted>", value)
+    return BEARER_TOKEN_RE.sub(r"\1<redacted>", value)
+
+
+def format_command(command):
+    parts = [str(part) for part in command]
+    if len(parts) >= 3 and Path(parts[0]).name == "ssh" and parts[-3:-1] == ["bash", "-lc"]:
+        parts = [*parts[:-1], "<remote-script>"]
+    return redact_sensitive_text(shlex.join(parts))
+
+
 def run(command, *, stdin=None, stdout=None, check=True):
-    log("+ " + shlex.join(str(part) for part in command))
+    log("+ " + format_command(command))
     result = subprocess.run(command, stdin=stdin, stdout=stdout, check=False)
     if check and result.returncode != 0:
-        fail(f"command failed with exit code {result.returncode}: {shlex.join(str(part) for part in command)}")
+        fail(f"command failed with exit code {result.returncode}: {format_command(command)}")
     return result
 
 
@@ -476,15 +495,25 @@ def main():
             f"docker rm -f {container_name_q} >/dev/null 2>&1 || true",
             shlex.join(docker_args),
             "agent_status=$?",
-            "printf '%s\\n' \"guest docker run exited with code ${agent_status}\" >&2",
+            "codex_marker_status=",
+            f"for _ in $(seq 1 20); do "
+            f"codex_marker_status=$(docker logs {container_name_q} 2>&1 | sed -n 's/^codex_exit_status=//p' | tail -n 1 || true); "
+            "[ -n \"$codex_marker_status\" ] && break; "
+            "sleep 0.1; "
+            "done",
             f"container_status=$(docker inspect --format '{{{{.State.ExitCode}}}}' {container_name_q} 2>/dev/null || true)",
-            "if [ -n \"$container_status\" ]; then "
-            "printf '%s\\n' \"guest container state exit code ${container_status}\" >&2; "
-            "agent_status=\"$container_status\"; "
-            "fi",
-            f"if [ \"$agent_status\" -ne 0 ] && docker logs {container_name_q} 2>&1 | grep -qx 'codex_exit_status=0'; then "
-            "printf '%s\\n' 'guest container reported nonzero status but Codex exit marker was 0; using Codex status' >&2; "
-            "agent_status=0; "
+            "case \"$codex_marker_status\" in "
+            "''|*[!0-9]* ) "
+            "if [ -n \"$container_status\" ]; then agent_status=\"$container_status\"; fi ;; "
+            "* ) "
+            "if [ \"$agent_status\" -ne \"$codex_marker_status\" ] || [ \"$container_status\" != \"$codex_marker_status\" ]; then "
+            "printf '%s\\n' \"guest container status differed from Codex marker; using Codex marker: docker=${agent_status} container=${container_status:-unknown} codex=${codex_marker_status}\" >&2; "
+            "fi; "
+            "agent_status=\"$codex_marker_status\" ;; "
+            "esac",
+            "if [ \"$agent_status\" -ne 0 ]; then "
+            "printf '%s\\n' \"guest docker run exited with code ${agent_status}\" >&2; "
+            "if [ -n \"$container_status\" ]; then printf '%s\\n' \"guest container state exit code ${container_status}\" >&2; fi; "
             "fi",
             f"docker rm -f {container_name_q} >/dev/null 2>&1 || true",
             "exit \"$agent_status\"",
@@ -494,12 +523,20 @@ def main():
 
         log("syncing workspace changes back from guest")
         tar_from_guest(ssh_base, guest_workspace, repo)
+        root_ssh_base = [
+            "ssh",
+            "-i", str(key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=3",
+            f"root@{guest_ip}",
+        ]
         shutdown_script = (
-            "sudo python3 -c 'import ctypes, os; os.sync(); "
+            "python3 -c 'import ctypes, os; os.sync(); "
             "ctypes.CDLL(None).reboot(0x4321fedc)' "
-            "|| sudo poweroff || sudo shutdown -h now || sudo halt -f || true"
+            "|| poweroff || shutdown -h now || halt -f || true"
         )
-        run(["timeout", "8", *ssh_base, "bash", "-lc", shlex.quote(shutdown_script)], check=False)
+        run(["timeout", "8", *root_ssh_base, "bash", "-lc", shlex.quote(shutdown_script)], check=False)
     finally:
         if firecracker_process:
             try:
