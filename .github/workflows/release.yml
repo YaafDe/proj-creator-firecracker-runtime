@@ -19,7 +19,9 @@ jobs:
       BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.version }}
       PROJ_CREATOR_FIRECRACKER_RUNTIME_VERSION: ${{ inputs.version }}
       PROJ_CREATOR_FIRECRACKER_KERNEL_PUBLIC_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.version }}
-      PROJ_CREATOR_FIRECRACKER_KERNEL_PROVIDER: ubuntu
+      PROJ_CREATOR_FIRECRACKER_KERNEL_PROVIDER: firecracker-ci
+      PROJ_CREATOR_FIRECRACKER_CONFIG_VERSION: "5.10"
+      PROJ_CREATOR_FIRECRACKER_SKIP_VMCLOCK: "1"
     steps:
       - uses: actions/checkout@v4
 
