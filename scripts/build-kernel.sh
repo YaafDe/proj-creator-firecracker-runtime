@@ -254,7 +254,20 @@ build_firecracker_ci_kernel() {
 
   (
     cd "$src_dir"
+    set +e
     ./tools/devtool build_ci_artifacts kernels "$firecracker_config_version"
+    devtool_status=$?
+    set -e
+    if [ "$devtool_status" -ne 0 ] && ! find "resources/$arch" -maxdepth 2 -type f \
+      \( -name 'vmlinux*' -o -name 'Image*' \) \
+      ! -name '*.config' \
+      ! -name '*.json' \
+      -print -quit | grep -q .; then
+      exit "$devtool_status"
+    fi
+    if [ "$devtool_status" -ne 0 ]; then
+      echo "Firecracker devtool exited ${devtool_status} after producing a kernel artifact; continuing" >&2
+    fi
   )
 
   kernel_candidate="$(
