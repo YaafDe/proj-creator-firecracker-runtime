@@ -192,7 +192,7 @@ build_ubuntu_kernel() {
       make ARCH=x86_64 olddefconfig
       grep -q "^CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y$" .config
       make ARCH=x86_64 -j"$(nproc)" vmlinux
-      strings vmlinux | grep -q "virtio_mmio.device"
+      grep -aq "virtio_mmio.device" vmlinux
       install -m 0644 vmlinux /out/vmlinux
     '
 
