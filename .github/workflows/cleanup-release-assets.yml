@@ -19,7 +19,10 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const keepVersion = core.getInput('keep_version', { required: true });
+            const keepVersion = context.payload.inputs.keep_version;
+            if (!keepVersion) {
+              throw new Error('keep_version input is required');
+            }
             const releases = await github.paginate(github.rest.repos.listReleases, {
               owner: context.repo.owner,
               repo: context.repo.repo,
