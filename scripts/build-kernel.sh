@@ -65,10 +65,12 @@ clone_firecracker_config_source() {
   local src_dir="$work_dir/firecracker"
   if [ ! -d "$src_dir/.git" ]; then
     git clone --depth 1 --branch "$firecracker_ref" \
-      https://github.com/firecracker-microvm/firecracker.git "$src_dir"
+      https://github.com/firecracker-microvm/firecracker.git "$src_dir" >&2
   else
+    git -C "$src_dir" reset --hard HEAD >/dev/null
+    git -C "$src_dir" clean -fd >/dev/null
     git -C "$src_dir" fetch --depth 1 origin "$firecracker_ref"
-    git -C "$src_dir" checkout --detach FETCH_HEAD
+    git -C "$src_dir" checkout --detach FETCH_HEAD >/dev/null
   fi
   git -C "$src_dir" reset --hard HEAD >/dev/null
   echo "$src_dir"
