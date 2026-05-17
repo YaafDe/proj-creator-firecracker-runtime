@@ -213,16 +213,10 @@ old_patch_loop = """    # Apply any patchset we have for our kernels
         git apply ${patchset}/${KERNEL_VERSION}/*.patch
     done
 """
-new_patch_loop = """    # Apply any patchset we have for our kernels, unless disabled by the wrapper.
-    if [[ "${FC_SKIP_KERNEL_PATCHSETS:-0}" != "1" ]]; then
-        for patchset in ../patches/*; do
-            if ! compgen -G "${patchset}/${KERNEL_VERSION}/*.patch" >/dev/null; then
-                continue
-            fi
-            echo "Applying patchset ${patchset}/${KERNEL_VERSION}"
-            git apply ${patchset}/${KERNEL_VERSION}/*.patch
-        done
-    fi
+new_patch_loop = """    # The worker runtime does not attach Firecracker's vmclock device. Current
+    # Amazon Linux 5.10 tags can already contain parts of the vmclock ABI, so the
+    # Firecracker v1.15.1 backport patchset may fail to apply. Skip optional
+    # patchsets entirely for the no-vmclock release kernel.
 """
 if old_patch_loop not in text:
     raise SystemExit("Firecracker resources/rebuild.sh patch loop changed; update build-kernel.sh")
@@ -260,11 +254,7 @@ build_firecracker_ci_kernel() {
 
   (
     cd "$src_dir"
-    if [ "$skip_vmclock" = "1" ]; then
-      FC_SKIP_KERNEL_PATCHSETS=1 ./tools/devtool build_ci_artifacts kernels "$firecracker_config_version"
-    else
-      ./tools/devtool build_ci_artifacts kernels "$firecracker_config_version"
-    fi
+    ./tools/devtool build_ci_artifacts kernels "$firecracker_config_version"
   )
 
   kernel_candidate="$(
