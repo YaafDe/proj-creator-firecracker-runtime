@@ -19,6 +19,14 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
+def emit_status(phase, message):
+    print(json.dumps({
+        "type": "status",
+        "phase": phase,
+        "message": message,
+    }, separators=(",", ":")), flush=True)
+
+
 def fail(message, code=70):
     log(f"firecracker-runner: {message}")
     raise SystemExit(code)
@@ -63,6 +71,22 @@ def run_privileged(command, *, check=True):
         return run(command, check=check)
     sudo = require_command("sudo")
     return run([sudo, *command], check=check)
+
+
+def run_quiet(command, *, check=False):
+    return subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def run_privileged_quiet(command, *, check=False):
+    if os.geteuid() == 0:
+        return run_quiet(command, check=check)
+    sudo = require_command("sudo")
+    return run_quiet([sudo, *command], check=check)
 
 
 class UnixHttpConnection(http.client.HTTPConnection):
@@ -113,6 +137,18 @@ def ssh_command(ssh_base, script, *, check=True, stdout=None, stdin=None):
     return run([*ssh_base, "bash", "-lc", shlex.quote(script)], check=check, stdout=stdout, stdin=stdin)
 
 
+def terminate_process(process, name):
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        log(f"{name} did not exit after terminate; killing")
+        process.kill()
+        process.wait(timeout=5)
+
+
 def tar_to_guest(ssh_base, source, destination):
     script = f"mkdir -p {shlex.quote(destination)} && tar -C {shlex.quote(destination)} -xf -"
     tar = subprocess.Popen(["tar", "-C", str(source), "-cf", "-", "."], stdout=subprocess.PIPE)
@@ -141,15 +177,38 @@ def tar_from_guest(ssh_base, source, destination):
 
 def load_docker_image_to_guest(ssh_base, image):
     run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL)
+    timeout_seconds = int(os.environ.get("PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS", "900"))
     save = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+    ssh = None
     try:
-        ssh_command(ssh_base, "docker load", stdin=save.stdout)
+        ssh = subprocess.Popen(
+            [*ssh_base, "bash", "-lc", shlex.quote("docker load")],
+            stdin=save.stdout,
+        )
+        if save.stdout:
+            save.stdout.close()
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            save_status = save.poll()
+            ssh_status = ssh.poll()
+            if save_status is not None and ssh_status is not None:
+                break
+            if time.monotonic() > deadline:
+                terminate_process(save, "docker save")
+                terminate_process(ssh, "guest docker load")
+                fail(f"timed out after {timeout_seconds}s loading Docker image into guest: {image}")
+            time.sleep(0.5)
     finally:
         if save.stdout:
             save.stdout.close()
+        if ssh is not None:
+            terminate_process(ssh, "guest docker load")
     status = save.wait()
     if status != 0:
         fail(f"docker save failed with exit code {status}: {image}")
+    ssh_status = ssh.wait() if ssh is not None else 1
+    if ssh_status != 0:
+        fail(f"guest docker load failed with exit code {ssh_status}: {image}")
 
 
 def parse_size(value):
@@ -217,6 +276,77 @@ def stable_network(run_dir):
     mac = f"06:00:ac:1f:{octet:02x}:02"
     tap = f"pcfc{digest[1]:02x}{digest[2]:02x}{digest[3]:02x}"[:15]
     return tap, host_ip, guest_ip, mac
+
+
+def guest_subnet(host_ip):
+    return ".".join(host_ip.split(".")[:3]) + ".0/24"
+
+
+def iptables_rule_exists(args):
+    return run_privileged_quiet(["iptables", *args], check=False).returncode == 0
+
+
+def ensure_iptables_rule(table, chain, rule):
+    check_args = []
+    if table:
+        check_args.extend(["-t", table])
+    check_args.extend(["-C", chain, *rule])
+    if iptables_rule_exists(check_args):
+        return None
+
+    add_args = []
+    if table:
+        add_args.extend(["-t", table])
+    add_args.extend(["-A", chain, *rule])
+    run_privileged(["iptables", *add_args])
+
+    delete_args = []
+    if table:
+        delete_args.extend(["-t", table])
+    delete_args.extend(["-D", chain, *rule])
+    return ["iptables", *delete_args]
+
+
+def setup_guest_nat(tap, host_ip):
+    require_command("iptables")
+    require_command("sysctl")
+    subnet = guest_subnet(host_ip)
+    run_privileged(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+    cleanup = []
+    for table, chain, rule in [
+        ("nat", "POSTROUTING", ["-s", subnet, "!", "-o", tap, "-j", "MASQUERADE"]),
+        (None, "FORWARD", ["-i", tap, "-j", "ACCEPT"]),
+        (
+            None,
+            "FORWARD",
+            ["-o", tap, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        ),
+    ]:
+        delete_command = ensure_iptables_rule(table, chain, rule)
+        if delete_command is not None:
+            cleanup.append(delete_command)
+    log(f"guest NAT enabled for {subnet} via {tap}")
+    return cleanup
+
+
+def cleanup_guest_nat(cleanup_commands):
+    for command in reversed(cleanup_commands):
+        run_privileged(command, check=False)
+
+
+def firecracker_dns_servers():
+    raw = os.environ.get("PROJ_CREATOR_FIRECRACKER_DNS_SERVERS", "1.1.1.1,8.8.8.8")
+    servers = [part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()]
+    if not servers:
+        fail("PROJ_CREATOR_FIRECRACKER_DNS_SERVERS did not contain any DNS servers")
+    return servers
+
+
+def configure_guest_dns(root_ssh_base, dns_servers):
+    lines = "".join(f"nameserver {server}\n" for server in dns_servers)
+    script = f"printf '%s' {shlex.quote(lines)} > /etc/resolv.conf"
+    ssh_command(root_ssh_base, script)
+    log(f"configured guest DNS servers: {', '.join(dns_servers)}")
 
 
 LOCAL_URL_RE = re.compile(
@@ -375,6 +505,7 @@ def main():
         require_command(command)
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    emit_status("setup", "Preparing Firecracker run directory")
     socket_id = hashlib.sha256(str(run_dir).encode("utf-8")).hexdigest()[:16]
     api_socket = Path(os.environ.get("TMPDIR", "/tmp")) / f"pcfc-{socket_id}.sock"
     key_path = run_dir / "guest_ssh_key"
@@ -388,9 +519,11 @@ def main():
         except FileNotFoundError:
             pass
 
+    emit_status("setup", "Preparing Firecracker rootfs")
     grow_rootfs(rootfs)
     run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)])
     public_key = key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
+    emit_status("setup", "Injecting guest SSH key")
     inject_ssh_key(rootfs, mount_dir, public_key)
 
     tap, host_ip, guest_ip, mac = stable_network(run_dir)
@@ -402,17 +535,24 @@ def main():
     firecracker_process = None
     fc_log = None
     loopback_proxies = []
+    nat_cleanup = []
     exit_code = 1
     try:
+        emit_status("setup", "Configuring Firecracker network")
+        # A killed runner can leave the deterministic per-run tap behind. Drop
+        # it before recreating the device so retries are idempotent.
+        run_privileged(["ip", "link", "del", tap], check=False)
         run_privileged(["ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", str(os.getuid())])
         run_privileged(["ip", "addr", "add", f"{host_ip}/24", "dev", tap])
         run_privileged(["ip", "link", "set", tap, "up"])
+        nat_cleanup = setup_guest_nat(tap, host_ip)
         for port in sorted(local_proxy_ports):
             proxy = start_loopback_proxy(host_ip, port)
             if proxy is not None:
                 loopback_proxies.append(proxy)
 
         fc_log = log_path.open("ab")
+        emit_status("run", "Starting Firecracker VM")
         firecracker_process = subprocess.Popen(
             [firecracker, "--api-sock", str(api_socket)],
             stdout=fc_log,
@@ -434,7 +574,7 @@ def main():
         firecracker_request(api_socket, "PUT", "/metrics", {"metrics_path": str(metrics_path)})
         firecracker_request(api_socket, "PUT", "/machine-config", {
             "vcpu_count": int(os.environ.get("PROJ_CREATOR_FIRECRACKER_VCPUS", "2")),
-            "mem_size_mib": int(os.environ.get("PROJ_CREATOR_FIRECRACKER_MEM_MIB", "4096")),
+            "mem_size_mib": int(os.environ.get("PROJ_CREATOR_FIRECRACKER_MEM_MIB", "8192")),
             "smt": False,
         })
         firecracker_request(api_socket, "PUT", "/boot-source", {
@@ -460,17 +600,36 @@ def main():
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=3",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=2",
             f"appuser@{guest_ip}",
         ]
+        root_ssh_base = [
+            "ssh",
+            "-i", str(key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=3",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=2",
+            f"root@{guest_ip}",
+        ]
+        dns_servers = firecracker_dns_servers()
+        emit_status("run", "Waiting for guest SSH")
         wait_for_ssh(ssh_base, 120)
+        emit_status("run", "Configuring guest DNS")
+        configure_guest_dns(root_ssh_base, dns_servers)
+        emit_status("run", "Waiting for guest Docker")
         ssh_command(
             ssh_base,
             "for i in $(seq 1 120); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1",
         )
+        emit_status("run", "Loading agent image into guest")
         log(f"loading agent image into guest: {selected_image}")
         load_docker_image_to_guest(ssh_base, selected_image)
 
         guest_workspace = workdir if workdir.startswith("/") else f"/workspace/{workdir}"
+        emit_status("workspace", "Staging workspace into guest")
         log(f"staging workspace into guest {guest_workspace}")
         tar_to_guest(ssh_base, repo, guest_workspace)
 
@@ -483,6 +642,8 @@ def main():
             "-v", f"{guest_workspace}:{workdir}",
             "-w", workdir,
         ]
+        for dns_server in dns_servers:
+            docker_args.extend(["--dns", dns_server])
         for key, value in envs:
             docker_args.extend(["-e", f"{key}={value}"])
         if request.get("extra_docker_args"):
@@ -518,19 +679,13 @@ def main():
             f"docker rm -f {container_name_q} >/dev/null 2>&1 || true",
             "exit \"$agent_status\"",
         ])
+        emit_status("run", "Running agent container")
         exit_code = ssh_command(ssh_base, remote_script, check=False).returncode
         log(f"guest agent command exited with code {exit_code}")
 
+        emit_status("workspace", "Syncing workspace changes from guest")
         log("syncing workspace changes back from guest")
         tar_from_guest(ssh_base, guest_workspace, repo)
-        root_ssh_base = [
-            "ssh",
-            "-i", str(key_path),
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=3",
-            f"root@{guest_ip}",
-        ]
         shutdown_script = (
             "python3 -c 'import ctypes, os; os.sync(); "
             "ctypes.CDLL(None).reboot(0x4321fedc)' "
@@ -556,6 +711,7 @@ def main():
             pass
         if "tap" in locals():
             run_privileged(["ip", "link", "del", tap], check=False)
+        cleanup_guest_nat(nat_cleanup)
         stop_loopback_proxies(loopback_proxies)
 
     raise SystemExit(exit_code)
