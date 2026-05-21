@@ -169,6 +169,48 @@ def chown_guest_workspace(root_ssh_base, destination, uid, gid):
     log(f"guest workspace ownership set to {uid}:{gid}: {destination}")
 
 
+def chown_host_path(destination, uid, gid):
+    run_privileged(["chown", "-R", f"{uid}:{gid}", str(destination)])
+    log(f"host workspace ownership set to {uid}:{gid}: {destination}")
+
+
+def container_workspace_target(workdir):
+    if workdir.startswith("/workspace/"):
+        return "/workspace"
+    if workdir.startswith("/"):
+        return workdir
+    return f"/workspace/{workdir}"
+
+
+def sync_host_path_to_guest(root_ssh_base, host_path, guest_path, uid, gid):
+    host = Path(host_path)
+    if not host.exists():
+        fail(f"Firecracker support mount source does not exist: {host_path}")
+
+    guest_path_q = shlex.quote(guest_path)
+    if host.is_dir():
+        script = f"mkdir -p {guest_path_q} && tar -C {guest_path_q} -xf -"
+        tar = subprocess.Popen(["tar", "-C", str(host), "-cf", "-", "."], stdout=subprocess.PIPE)
+        try:
+            ssh_command(root_ssh_base, script, stdin=tar.stdout)
+        finally:
+            if tar.stdout:
+                tar.stdout.close()
+        status = tar.wait()
+        if status != 0:
+            fail(f"support mount tar export failed with exit code {status}: {host_path}")
+    else:
+        mode = host.stat().st_mode & 0o777
+        parent_q = shlex.quote(str(Path(guest_path).parent))
+        with host.open("rb") as source:
+            ssh_command(
+                root_ssh_base,
+                f"mkdir -p {parent_q} && cat > {guest_path_q} && chmod {mode:o} {guest_path_q}",
+                stdin=source,
+            )
+    chown_guest_workspace(root_ssh_base, guest_path, uid, gid)
+
+
 def tar_from_guest(ssh_base, source, destination):
     tar = subprocess.Popen(["tar", "-C", str(destination), "-xf", "-"], stdin=subprocess.PIPE)
     try:
@@ -180,6 +222,35 @@ def tar_from_guest(ssh_base, source, destination):
     status = tar.wait()
     if status != 0:
         fail(f"workspace tar import failed with exit code {status}")
+
+
+def fetch_guest_file(ssh_base, source, destination):
+    source_q = shlex.quote(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as output:
+        result = ssh_command(
+            ssh_base,
+            f"if [ -f {source_q} ]; then cat {source_q}; fi",
+            check=False,
+            stdout=output,
+        )
+    if result.returncode != 0:
+        log(f"failed to fetch guest file {source}: ssh exited {result.returncode}")
+
+
+def sync_mount_back_to_host(root_ssh_base, mount, uid, gid):
+    if mount.get("read_only"):
+        return
+    purpose = str(mount.get("purpose") or "")
+    if purpose not in {"runtime_support", "claude_session", "codex_session"}:
+        return
+    host_path = Path(str(mount.get("host_path") or ""))
+    guest_path = str(mount.get("guest_path") or "")
+    if not host_path.is_dir() or not guest_path:
+        return
+    log(f"syncing Firecracker support mount back from guest {guest_path} to {host_path}")
+    tar_from_guest(root_ssh_base, guest_path, host_path)
+    chown_host_path(host_path, uid, gid)
 
 
 def load_docker_image_to_guest(ssh_base, image):
@@ -637,11 +708,23 @@ def main():
         log(f"loading agent image into guest: {selected_image}")
         load_docker_image_to_guest(ssh_base, selected_image)
 
-        guest_workspace = workdir if workdir.startswith("/") else f"/workspace/{workdir}"
+        workspace_target = container_workspace_target(workdir)
+        guest_workspace = workspace_target
         emit_status("workspace", "Staging workspace into guest")
         log(f"staging workspace into guest {guest_workspace}")
         tar_to_guest(ssh_base, repo, guest_workspace)
         chown_guest_workspace(root_ssh_base, guest_workspace, workspace_uid, workspace_gid)
+
+        guest_mounts = []
+        for mount in request.get("mounts") or []:
+            guest_path = str(mount.get("guest_path") or "")
+            host_path = str(mount.get("host_path") or "")
+            if not guest_path or not host_path:
+                continue
+            emit_status("workspace", f"Staging support mount {mount.get('purpose') or 'runtime_support'}")
+            sync_host_path_to_guest(root_ssh_base, host_path, guest_path, workspace_uid, workspace_gid)
+            mode = ":ro" if mount.get("read_only") else ""
+            guest_mounts.extend(["-v", f"{guest_path}:{guest_path}{mode}"])
 
         container_suffix = re.sub(r"[^a-zA-Z0-9_.-]", "-", str(request.get("message_id") or "run"))[:48]
         agent_container_name = f"proj-creator-agent-{container_suffix}"
@@ -649,8 +732,9 @@ def main():
             "docker", "run",
             "--name", agent_container_name,
             "--network", "host",
-            "-v", f"{guest_workspace}:{workdir}",
-            "-w", workdir,
+            "-v", f"{guest_workspace}:{workspace_target}",
+            "-w", workspace_target,
+            *guest_mounts,
         ]
         for dns_server in dns_servers:
             docker_args.extend(["--dns", dns_server])
@@ -663,12 +747,14 @@ def main():
         container_name_q = shlex.quote(agent_container_name)
         remote_script = "\n".join([
             "set -uo pipefail",
+            "agent_log=/tmp/proj-creator-agent-container.log",
+            ": > \"$agent_log\"",
             f"docker rm -f {container_name_q} >/dev/null 2>&1 || true",
-            shlex.join(docker_args),
-            "agent_status=$?",
+            f"{shlex.join(docker_args)} 2>&1 | tee \"$agent_log\"",
+            "agent_status=${PIPESTATUS[0]}",
             "codex_marker_status=",
             f"for _ in $(seq 1 20); do "
-            f"codex_marker_status=$(docker logs {container_name_q} 2>&1 | sed -n 's/^codex_exit_status=//p' | tail -n 1 || true); "
+            "codex_marker_status=$(sed -n 's/^codex_exit_status=//p' \"$agent_log\" | tail -n 1 || true); "
             "[ -n \"$codex_marker_status\" ] && break; "
             "sleep 0.1; "
             "done",
@@ -692,10 +778,14 @@ def main():
         emit_status("run", "Running agent container")
         exit_code = ssh_command(ssh_base, remote_script, check=False).returncode
         log(f"guest agent command exited with code {exit_code}")
+        fetch_guest_file(root_ssh_base, "/tmp/proj-creator-agent-container.log", run_dir / "agent-container.log")
 
+        for mount in request.get("mounts") or []:
+            sync_mount_back_to_host(root_ssh_base, mount, workspace_uid, workspace_gid)
         emit_status("workspace", "Syncing workspace changes from guest")
         log("syncing workspace changes back from guest")
         tar_from_guest(root_ssh_base, guest_workspace, repo)
+        chown_host_path(repo, workspace_uid, workspace_gid)
         shutdown_script = (
             "python3 -c 'import ctypes, os; os.sync(); "
             "ctypes.CDLL(None).reboot(0x4321fedc)' "
