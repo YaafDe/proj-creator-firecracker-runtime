@@ -26,7 +26,7 @@ jobs:
           grep -q -- '--containerd=/run/containerd/containerd.sock' rootfs/proj-creator-init
           grep -q -- '--userland-proxy=false' rootfs/proj-creator-init
           grep -q -- 'chown appuser:appuser /workspace' rootfs/proj-creator-init
-          grep -q -- '--uid 1000 --gid 1000' rootfs/Dockerfile
+          grep -q -- '--uid 10001 --gid 10001' rootfs/Dockerfile
           grep -q -- 'chown appuser:appuser /workspace' rootfs/Dockerfile
           grep -q 'VIRTIO_MMIO_CMDLINE_DEVICES' scripts/build-kernel.sh
           ./scripts/smoke-runner.sh
