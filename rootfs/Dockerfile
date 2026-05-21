@@ -22,8 +22,8 @@ RUN apt-get update \
 
 RUN mkdir -p /run/sshd /workspace /var/lib/proj-creator \
   && if getent passwd 1000 >/dev/null; then userdel -r "$(getent passwd 1000 | cut -d: -f1)" 2>/dev/null || userdel "$(getent passwd 1000 | cut -d: -f1)"; fi \
-  && if getent group 1000 >/dev/null; then groupmod -n appuser "$(getent group 1000 | cut -d: -f1)"; else groupadd --gid 1000 appuser; fi \
-  && useradd --uid 1000 --gid 1000 -m -s /bin/bash appuser \
+  && if getent group 10001 >/dev/null; then groupmod -n appuser "$(getent group 10001 | cut -d: -f1)"; else groupadd --gid 10001 appuser; fi \
+  && useradd --uid 10001 --gid 10001 -m -s /bin/bash appuser \
   && usermod -aG sudo,docker appuser \
   && chown appuser:appuser /workspace /var/lib/proj-creator \
   && printf 'appuser ALL=(ALL) NOPASSWD:ALL\n' >/etc/sudoers.d/appuser \

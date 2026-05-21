@@ -162,6 +162,13 @@ def tar_to_guest(ssh_base, source, destination):
         fail(f"workspace tar export failed with exit code {status}")
 
 
+def chown_guest_workspace(root_ssh_base, destination, uid, gid):
+    destination_q = shlex.quote(destination)
+    owner_q = shlex.quote(f"{uid}:{gid}")
+    ssh_command(root_ssh_base, f"chown -R {owner_q} {destination_q}")
+    log(f"guest workspace ownership set to {uid}:{gid}: {destination}")
+
+
 def tar_from_guest(ssh_base, source, destination):
     tar = subprocess.Popen(["tar", "-C", str(destination), "-xf", "-"], stdin=subprocess.PIPE)
     try:
@@ -492,6 +499,8 @@ def main():
     selected_image = request["selected_image"]
     inner_script = request["inner_script"]
     envs = request.get("envs") or []
+    workspace_uid = int(request.get("workspace_uid") or 10001)
+    workspace_gid = int(request.get("workspace_gid") or 10001)
 
     if not rootfs.is_file():
         fail(f"rootfs does not exist: {rootfs}")
@@ -632,6 +641,7 @@ def main():
         emit_status("workspace", "Staging workspace into guest")
         log(f"staging workspace into guest {guest_workspace}")
         tar_to_guest(ssh_base, repo, guest_workspace)
+        chown_guest_workspace(root_ssh_base, guest_workspace, workspace_uid, workspace_gid)
 
         container_suffix = re.sub(r"[^a-zA-Z0-9_.-]", "-", str(request.get("message_id") or "run"))[:48]
         agent_container_name = f"proj-creator-agent-{container_suffix}"
@@ -685,7 +695,7 @@ def main():
 
         emit_status("workspace", "Syncing workspace changes from guest")
         log("syncing workspace changes back from guest")
-        tar_from_guest(ssh_base, guest_workspace, repo)
+        tar_from_guest(root_ssh_base, guest_workspace, repo)
         shutdown_script = (
             "python3 -c 'import ctypes, os; os.sync(); "
             "ctypes.CDLL(None).reboot(0x4321fedc)' "
