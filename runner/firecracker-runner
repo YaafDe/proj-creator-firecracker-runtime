@@ -58,9 +58,20 @@ def format_command(command):
     return redact_sensitive_text(shlex.join(parts))
 
 
-def run(command, *, stdin=None, stdout=None, check=True):
+def run(command, *, stdin=None, stdout=None, check=True, timeout=None):
     log("+ " + format_command(command))
-    result = subprocess.run(command, stdin=stdin, stdout=stdout, check=False)
+    try:
+        result = subprocess.run(
+            command,
+            stdin=stdin,
+            stdout=stdout,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        if timeout is None:
+            fail(f"command timed out: {format_command(command)}")
+        fail(f"command timed out after {timeout}s: {format_command(command)}")
     if check and result.returncode != 0:
         fail(f"command failed with exit code {result.returncode}: {format_command(command)}")
     return result
@@ -254,7 +265,15 @@ def sync_mount_back_to_host(root_ssh_base, mount, uid, gid):
 
 
 def load_docker_image_to_guest(ssh_base, image):
-    run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL)
+    inspect_timeout_seconds = int(os.environ.get(
+        "PROJ_CREATOR_FIRECRACKER_DOCKER_INSPECT_TIMEOUT_SECONDS",
+        "60",
+    ))
+    run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL,
+        timeout=inspect_timeout_seconds,
+    )
     timeout_seconds = int(os.environ.get("PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS", "900"))
     save = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
     ssh = None
