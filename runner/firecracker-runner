@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -160,6 +161,67 @@ def terminate_process(process, name):
         process.wait(timeout=5)
 
 
+def read_tail(file_obj, max_bytes=8192):
+    file_obj.flush()
+    file_obj.seek(0, os.SEEK_END)
+    size = file_obj.tell()
+    file_obj.seek(max(0, size - max_bytes))
+    return file_obj.read().decode("utf-8", errors="replace")
+
+
+def log_prefixed_block(prefix, text):
+    text = redact_sensitive_text(text).strip()
+    if not text:
+        return
+    for line in text.splitlines():
+        log(f"{prefix}: {line}")
+
+
+def collect_guest_docker_load_diagnostics(ssh_base, image):
+    timeout_seconds = int(os.environ.get(
+        "PROJ_CREATOR_FIRECRACKER_DOCKER_DIAGNOSTIC_TIMEOUT_SECONDS",
+        "25",
+    ))
+    image_q = shlex.quote(image)
+    script = f"""
+set +e
+echo '== guest identity =='
+id
+uname -a
+echo '== docker info =='
+docker info --format 'ServerVersion={{{{.ServerVersion}}}} Driver={{{{.Driver}}}} DockerRootDir={{{{.DockerRootDir}}}}' 2>&1
+echo '== docker image presence =='
+docker image inspect --format '{{{{.Id}}}} {{{{.Size}}}}' {image_q} 2>&1
+echo '== docker system df =='
+docker system df 2>&1
+echo '== filesystems =='
+df -h / /var/lib/docker /tmp 2>&1
+echo '== memory =='
+free -m 2>&1 || true
+echo '== docker journal tail =='
+journalctl -u docker --no-pager -n 80 2>&1 || true
+echo '== kernel tail =='
+dmesg | tail -n 80 2>&1 || true
+"""
+    command = [*ssh_base, "bash", "-lc", shlex.quote(script)]
+    log("+ " + format_command(command))
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"guest docker-load diagnostics timed out after {timeout_seconds}s")
+        return
+    output = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+    log_prefixed_block("guest docker-load diagnostic", output)
+    if result.returncode != 0:
+        log(f"guest docker-load diagnostics exited {result.returncode}")
+
+
 def tar_to_guest(ssh_base, source, destination):
     script = f"mkdir -p {shlex.quote(destination)} && tar -C {shlex.quote(destination)} -xf -"
     tar = subprocess.Popen(["tar", "-C", str(source), "-cf", "-", "."], stdout=subprocess.PIPE)
@@ -277,35 +339,42 @@ def load_docker_image_to_guest(ssh_base, image):
     timeout_seconds = int(os.environ.get("PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS", "900"))
     save = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
     ssh = None
-    try:
-        ssh = subprocess.Popen(
-            [*ssh_base, "bash", "-lc", shlex.quote("docker load")],
-            stdin=save.stdout,
-        )
-        if save.stdout:
-            save.stdout.close()
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            save_status = save.poll()
-            ssh_status = ssh.poll()
-            if save_status is not None and ssh_status is not None:
-                break
-            if time.monotonic() > deadline:
-                terminate_process(save, "docker save")
+    with tempfile.TemporaryFile() as ssh_stderr:
+        try:
+            ssh = subprocess.Popen(
+                [*ssh_base, "bash", "-lc", shlex.quote("docker load")],
+                stdin=save.stdout,
+                stderr=ssh_stderr,
+            )
+            if save.stdout:
+                save.stdout.close()
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                save_status = save.poll()
+                ssh_status = ssh.poll()
+                if save_status is not None and ssh_status is not None:
+                    break
+                if time.monotonic() > deadline:
+                    terminate_process(save, "docker save")
+                    terminate_process(ssh, "guest docker load")
+                    log_prefixed_block("guest docker load stderr", read_tail(ssh_stderr))
+                    collect_guest_docker_load_diagnostics(ssh_base, image)
+                    fail(f"timed out after {timeout_seconds}s loading Docker image into guest: {image}")
+                time.sleep(0.5)
+        finally:
+            if save.stdout:
+                save.stdout.close()
+            if ssh is not None:
                 terminate_process(ssh, "guest docker load")
-                fail(f"timed out after {timeout_seconds}s loading Docker image into guest: {image}")
-            time.sleep(0.5)
-    finally:
-        if save.stdout:
-            save.stdout.close()
-        if ssh is not None:
-            terminate_process(ssh, "guest docker load")
-    status = save.wait()
-    if status != 0:
-        fail(f"docker save failed with exit code {status}: {image}")
-    ssh_status = ssh.wait() if ssh is not None else 1
-    if ssh_status != 0:
-        fail(f"guest docker load failed with exit code {ssh_status}: {image}")
+        status = save.wait()
+        if status != 0:
+            log_prefixed_block("guest docker load stderr", read_tail(ssh_stderr))
+            fail(f"docker save failed with exit code {status}: {image}")
+        ssh_status = ssh.wait() if ssh is not None else 1
+        if ssh_status != 0:
+            log_prefixed_block("guest docker load stderr", read_tail(ssh_stderr))
+            collect_guest_docker_load_diagnostics(ssh_base, image)
+            fail(f"guest docker load failed with exit code {ssh_status}: {image}")
 
 
 def parse_size(value):
