@@ -152,6 +152,22 @@ path.write_text(text, encoding="utf-8")
 PY
 }
 
+assert_microvm_kernel_config_file() {
+  local config_path="$1"
+  local symbol
+  for symbol in \
+    VIRTIO VIRTIO_BLK VIRTIO_NET VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES \
+    EXT4_FS DEVTMPFS DEVTMPFS_MOUNT NET_NS VETH BRIDGE BRIDGE_NETFILTER \
+    NETFILTER NF_CONNTRACK NF_NAT NETFILTER_XTABLES \
+    NETFILTER_XT_MATCH_CONNTRACK IP_NF_IPTABLES IP_NF_FILTER IP_NF_NAT IP_NF_RAW
+  do
+    if ! grep -q "^CONFIG_${symbol}=y$" "$config_path"; then
+      echo "required kernel configuration was dropped: CONFIG_${symbol} ($config_path)" >&2
+      return 1
+    fi
+  done
+}
+
 write_kernel_manifest() {
   local source_name="$1"
   local source_ref="$2"
@@ -328,7 +344,7 @@ build_firecracker_ci_kernel() {
   # patch the config consumed by rebuild.sh rather than only the Ubuntu test
   # provider's source tree.
   ensure_microvm_kernel_config_file "$config_path"
-  grep -q '^CONFIG_IP_NF_RAW=y$' "$config_path"
+  assert_microvm_kernel_config_file "$config_path"
   if [ "$skip_vmclock" = "1" ]; then
     patch_firecracker_rebuild_for_no_vmclock "$src_dir"
   fi
@@ -370,6 +386,18 @@ build_firecracker_ci_kernel() {
     echo "failed to find built Firecracker kernel under $src_dir/resources/$arch" >&2
     exit 1
   fi
+
+  kernel_config_candidate="$(
+    find "$src_dir/resources/$arch" -maxdepth 2 -type f -name '*.config' \
+      -printf '%T@ %p\n' \
+      | sort -nr \
+      | awk 'NR == 1 {print substr($0, index($0,$2))}'
+  )"
+  if [ -z "$kernel_config_candidate" ] || [ ! -f "$kernel_config_candidate" ]; then
+    echo "failed to find emitted Firecracker kernel config under $src_dir/resources/$arch" >&2
+    exit 1
+  fi
+  assert_microvm_kernel_config_file "$kernel_config_candidate"
 
   install -m 0644 "$kernel_candidate" "$kernel_out"
   write_kernel_manifest "firecracker-ci" "$firecracker_ref"

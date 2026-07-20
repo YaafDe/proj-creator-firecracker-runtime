@@ -17,15 +17,26 @@ from pathlib import Path
 
 
 def log(message):
-    print(message, file=sys.stderr, flush=True)
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except BrokenPipeError:
+        # The runner CLI can exit before this process finishes cancellation.
+        # Diagnostics are best-effort; a closed parent pipe must never abort
+        # tap, NAT, API-socket, or Firecracker process cleanup.
+        pass
 
 
 def emit_status(phase, message):
-    print(json.dumps({
-        "type": "status",
-        "phase": phase,
-        "message": message,
-    }, separators=(",", ":")), flush=True)
+    try:
+        print(json.dumps({
+            "type": "status",
+            "phase": phase,
+            "message": message,
+        }, separators=(",", ":")), flush=True)
+    except BrokenPipeError:
+        # See log(): status delivery is less important than deterministic
+        # teardown after cancellation or parent-process loss.
+        pass
 
 
 class RunnerInterrupted(Exception):
@@ -170,6 +181,18 @@ def docker_service_args(required, socket_gid):
         "-v", "/var/run/docker.sock:/var/run/docker.sock",
         "--group-add", socket_gid,
     ]
+
+
+def agent_container_identity_args(request):
+    args = ["--label", "proj-creator.runtime-role=agent"]
+    for request_key, label_key in [
+        ("conversation_id", "proj-creator.conversation-id"),
+        ("message_id", "proj-creator.message-id"),
+    ]:
+        value = request.get(request_key)
+        if value:
+            args.extend(["--label", f"{label_key}={value}"])
+    return args
 
 
 def terminate_process(process, name):
@@ -322,6 +345,36 @@ def load_docker_image_to_guest(ssh_base, image):
     ssh_status = ssh.wait() if ssh is not None else 1
     if ssh_status != 0:
         fail(f"guest docker load failed with exit code {ssh_status}: {image}")
+
+
+def load_image_and_stage_workspace(
+    ssh_base,
+    root_ssh_base,
+    image,
+    repo,
+    guest_workspace,
+    workspace_uid,
+    workspace_gid,
+):
+    log(f"loading agent image into guest: {image}")
+    load_docker_image_to_guest(ssh_base, image)
+
+    # Importing a large image can leave the guest CPU and filesystem busy long
+    # enough for sshd to miss the short per-attempt SSH banner timeout. Probe
+    # until SSH is responsive again instead of making workspace staging the
+    # first (and only) post-load connection attempt.
+    emit_status("run", "Waiting for guest SSH after image load")
+    wait_for_ssh(ssh_base, 120)
+
+    emit_status("workspace", "Staging workspace into guest")
+    log(f"staging workspace into guest {guest_workspace}")
+    tar_to_guest(ssh_base, repo, guest_workspace)
+    chown_guest_workspace(
+        root_ssh_base,
+        guest_workspace,
+        workspace_uid,
+        workspace_gid,
+    )
 
 
 def parse_size(value):
@@ -600,8 +653,10 @@ def stop_loopback_proxies(proxies):
             pass
 
 
-def main():
-    request = json.load(sys.stdin)
+def run_request(request):
+    contract_version = int(request.get("contract_version", 1))
+    if contract_version != 1:
+        fail(f"unsupported Firecracker runner contract version: {contract_version}")
     rootfs = Path(request["rootfs"]).resolve()
     kernel = Path(request["kernel_image"]).resolve()
     run_dir = Path(request["run_dir"]).resolve()
@@ -657,9 +712,6 @@ def main():
     loopback_proxies = []
     nat_cleanup = []
     exit_code = 1
-    previous_signal_handlers = {}
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        previous_signal_handlers[signum] = signal.signal(signum, raise_runner_interrupted)
     try:
         emit_status("setup", "Configuring Firecracker network")
         # A killed runner can leave the deterministic per-run tap behind. Drop
@@ -752,15 +804,18 @@ def main():
             "test -S /var/run/docker.sock && stat -c %g /var/run/docker.sock",
         ).strip()
         emit_status("run", "Loading agent image into guest")
-        log(f"loading agent image into guest: {selected_image}")
-        load_docker_image_to_guest(ssh_base, selected_image)
 
         workspace_target = container_workspace_target(workdir)
         guest_workspace = workspace_target
-        emit_status("workspace", "Staging workspace into guest")
-        log(f"staging workspace into guest {guest_workspace}")
-        tar_to_guest(ssh_base, repo, guest_workspace)
-        chown_guest_workspace(root_ssh_base, guest_workspace, workspace_uid, workspace_gid)
+        load_image_and_stage_workspace(
+            ssh_base,
+            root_ssh_base,
+            selected_image,
+            repo,
+            guest_workspace,
+            workspace_uid,
+            workspace_gid,
+        )
 
         guest_mounts = []
         for mount in request.get("mounts") or []:
@@ -778,6 +833,7 @@ def main():
         docker_args = [
             "docker", "run",
             "--name", agent_container_name,
+            *agent_container_identity_args(request),
             "--network", "host",
             "-v", f"{guest_workspace}:{workspace_target}",
             "-w", workspace_target,
@@ -864,10 +920,23 @@ def main():
             run_privileged(["ip", "link", "del", tap], check=False)
         cleanup_guest_nat(nat_cleanup)
         stop_loopback_proxies(loopback_proxies)
-        for signum, previous in previous_signal_handlers.items():
-            signal.signal(signum, previous)
 
     raise SystemExit(exit_code)
+
+
+def main():
+    previous_signal_handlers = {
+        signum: signal.signal(signum, raise_runner_interrupted)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        run_request(json.load(sys.stdin))
+    except RunnerInterrupted as interrupted:
+        log(f"received signal {interrupted.signum} before VM resource setup completed")
+        raise SystemExit(128 + interrupted.signum)
+    finally:
+        for signum, previous in previous_signal_handlers.items():
+            signal.signal(signum, previous)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,10 @@ loader.exec_module(module)
 
 
 class DockerServiceArgsTests(unittest.TestCase):
+    def test_unknown_runner_contract_is_rejected_before_resource_setup(self):
+        with self.assertRaises(SystemExit):
+            module.run_request({"contract_version": 2})
+
     def test_required_service_mounts_guest_socket_and_adds_socket_group(self):
         self.assertEqual(
             module.docker_service_args(True, "998\n"),
@@ -33,6 +37,80 @@ class DockerServiceArgsTests(unittest.TestCase):
     def test_required_service_rejects_invalid_socket_group(self):
         with self.assertRaises(SystemExit):
             module.docker_service_args(True, "root")
+
+    def test_agent_container_has_stable_runtime_owned_identity_labels(self):
+        self.assertEqual(
+            module.agent_container_identity_args(
+                {
+                    "conversation_id": "conversation-1",
+                    "message_id": "message-1",
+                }
+            ),
+            [
+                "--label",
+                "proj-creator.runtime-role=agent",
+                "--label",
+                "proj-creator.conversation-id=conversation-1",
+                "--label",
+                "proj-creator.message-id=message-1",
+            ],
+        )
+
+    def test_agent_container_identity_omits_absent_request_ids(self):
+        self.assertEqual(
+            module.agent_container_identity_args({}),
+            ["--label", "proj-creator.runtime-role=agent"],
+        )
+
+
+class GuestImageStagingTests(unittest.TestCase):
+    def test_waits_for_ssh_after_image_load_before_staging_workspace(self):
+        operations = mock.Mock()
+        ssh_base = ["ssh", "appuser@guest"]
+        root_ssh_base = ["ssh", "root@guest"]
+        repo = pathlib.Path("/tmp/repo")
+
+        with mock.patch.object(module, "emit_status"), mock.patch.object(
+            module,
+            "load_docker_image_to_guest",
+            operations.load_image,
+        ), mock.patch.object(
+            module,
+            "wait_for_ssh",
+            operations.wait_for_ssh,
+        ), mock.patch.object(
+            module,
+            "tar_to_guest",
+            operations.tar_to_guest,
+        ), mock.patch.object(
+            module,
+            "chown_guest_workspace",
+            operations.chown_guest_workspace,
+        ):
+            module.load_image_and_stage_workspace(
+                ssh_base,
+                root_ssh_base,
+                "proj-creator-agent:test",
+                repo,
+                "/workspace",
+                10001,
+                10001,
+            )
+
+        self.assertEqual(
+            operations.mock_calls,
+            [
+                mock.call.load_image(ssh_base, "proj-creator-agent:test"),
+                mock.call.wait_for_ssh(ssh_base, 120),
+                mock.call.tar_to_guest(ssh_base, repo, "/workspace"),
+                mock.call.chown_guest_workspace(
+                    root_ssh_base,
+                    "/workspace",
+                    10001,
+                    10001,
+                ),
+            ],
+        )
 
 
 class NetworkCleanupTests(unittest.TestCase):
@@ -76,6 +154,11 @@ class NetworkCleanupTests(unittest.TestCase):
 
 
 class SignalHandlingTests(unittest.TestCase):
+    def test_closed_parent_pipes_do_not_interrupt_cleanup_diagnostics(self):
+        with mock.patch("builtins.print", side_effect=BrokenPipeError):
+            module.log("cleanup diagnostic")
+            module.emit_status("cleanup", "removing resources")
+
     def test_utility_decoding_does_not_install_process_signal_handlers(self):
         before = {
             signum: signal.getsignal(signum)
@@ -90,6 +173,48 @@ class SignalHandlingTests(unittest.TestCase):
                 for signum in (signal.SIGTERM, signal.SIGINT)
             },
             before,
+        )
+
+    def test_main_installs_handlers_before_request_setup_and_restores_them(self):
+        before = {
+            signum: signal.getsignal(signum)
+            for signum in (signal.SIGTERM, signal.SIGINT)
+        }
+
+        def interrupt_during_setup(_request):
+            self.assertIs(signal.getsignal(signal.SIGTERM), module.raise_runner_interrupted)
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+        with mock.patch.object(module.json, "load", return_value={}), mock.patch.object(
+            module, "run_request", side_effect=interrupt_during_setup
+        ), self.assertRaises(SystemExit) as exited:
+            module.main()
+
+        self.assertEqual(exited.exception.code, 128 + signal.SIGTERM)
+        self.assertEqual(
+            {
+                signum: signal.getsignal(signum)
+                for signum in (signal.SIGTERM, signal.SIGINT)
+            },
+            before,
+        )
+
+    def test_ssh_key_mount_is_unmounted_when_setup_is_interrupted(self):
+        rootfs = pathlib.Path("/tmp/rootfs.ext4")
+        mount_dir = pathlib.Path("/tmp/rootfs-mount")
+        with mock.patch.object(module, "run_privileged") as run_privileged, mock.patch.object(
+            module,
+            "rootfs_user_ids",
+            side_effect=module.RunnerInterrupted(signal.SIGTERM),
+        ), self.assertRaises(module.RunnerInterrupted):
+            module.inject_ssh_key(rootfs, mount_dir, "ssh-ed25519 test")
+
+        self.assertEqual(
+            run_privileged.call_args_list,
+            [
+                mock.call(["mount", "-o", "loop", str(rootfs), str(mount_dir)]),
+                mock.call(["umount", str(mount_dir)], check=False),
+            ],
         )
 
 

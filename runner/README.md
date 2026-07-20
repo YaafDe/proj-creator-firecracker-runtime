@@ -19,6 +19,10 @@ agent Docker image inside the VM after loading it from the host Docker daemon,
 then syncs the workspace back while excluding `.git` so host Git metadata is not
 overwritten by the guest copy.
 
+The runner accepts Firecracker runner contract version `1`. Requests that omit
+`contract_version` are treated as v1 for compatibility with older Runner CLI
+releases; unknown versions are rejected before host resources are acquired.
+
 When the request sets `docker_service_required: true`, the runner mounts the
 guest's `/var/run/docker.sock` into the agent container and adds the socket's
 numeric group ID to the container process. This exposes only the disposable
