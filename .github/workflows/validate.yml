@@ -21,14 +21,19 @@ jobs:
           bash -n scripts/smoke-runner.sh
           bash -n rootfs/proj-creator-init
           python3 -m py_compile runner/firecracker-runner
+          ./scripts/test-runner-docker-service.py
           grep -q -- '"/bin/bash", "-lc"' runner/firecracker-runner
           grep -q -- '/usr/bin/containerd' rootfs/proj-creator-init
           grep -q -- '--containerd=/run/containerd/containerd.sock' rootfs/proj-creator-init
+          grep -q -- 'net.ipv4.ip_forward=1' rootfs/proj-creator-init
+          grep -q -- '--iptables=true' rootfs/proj-creator-init
+          grep -q -- '--ip-forward=true' rootfs/proj-creator-init
           grep -q -- '--userland-proxy=false' rootfs/proj-creator-init
           grep -q -- 'chown appuser:appuser /workspace' rootfs/proj-creator-init
           grep -q -- '--uid 10001 --gid 10001' rootfs/Dockerfile
           grep -q -- 'chown appuser:appuser /workspace' rootfs/Dockerfile
           grep -q 'VIRTIO_MMIO_CMDLINE_DEVICES' scripts/build-kernel.sh
+          grep -q 'IP_NF_RAW' scripts/build-kernel.sh
           ./scripts/smoke-runner.sh
           PROJ_CREATOR_FIRECRACKER_KERNEL_DRY_RUN=1 ./scripts/build-kernel.sh
           PROJ_CREATOR_FIRECRACKER_ROOTFS_DRY_RUN=1 ./scripts/build-rootfs.sh

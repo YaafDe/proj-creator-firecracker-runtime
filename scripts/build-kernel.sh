@@ -64,7 +64,7 @@ resolve_ubuntu_kernel_tag() {
 clone_firecracker_config_source() {
   local src_dir="$work_dir/firecracker"
   if [ ! -d "$src_dir/.git" ]; then
-    git clone --depth 1 --branch "$firecracker_ref" \
+    git -c core.autocrlf=false clone --depth 1 --branch "$firecracker_ref" \
       https://github.com/firecracker-microvm/firecracker.git "$src_dir" >&2
   else
     git -C "$src_dir" reset --hard HEAD >/dev/null
@@ -72,7 +72,11 @@ clone_firecracker_config_source() {
     git -C "$src_dir" fetch --depth 1 origin "$firecracker_ref"
     git -C "$src_dir" checkout --detach FETCH_HEAD >/dev/null
   fi
+  git -C "$src_dir" config core.autocrlf false
   git -C "$src_dir" reset --hard HEAD >/dev/null
+  # The host may have core.autocrlf=true. Kernel build scripts must retain the
+  # repository's LF bytes, so overwrite the worktree from a filter-free archive.
+  git -C "$src_dir" archive HEAD | tar -x -C "$src_dir"
   echo "$src_dir"
 }
 
@@ -88,8 +92,64 @@ ensure_microvm_kernel_config() {
       --enable VIRTIO_MMIO_CMDLINE_DEVICES \
       --enable EXT4_FS \
       --enable DEVTMPFS \
-      --enable DEVTMPFS_MOUNT
+      --enable DEVTMPFS_MOUNT \
+      --enable NET_NS \
+      --enable VETH \
+      --enable BRIDGE \
+      --enable BRIDGE_NETFILTER \
+      --enable NETFILTER \
+      --enable NF_CONNTRACK \
+      --enable NF_NAT \
+      --enable NETFILTER_XTABLES \
+      --enable NETFILTER_XT_MATCH_CONNTRACK \
+      --enable IP_NF_IPTABLES \
+      --enable IP_NF_FILTER \
+      --enable IP_NF_NAT \
+      --enable IP_NF_RAW
   )
+}
+
+ensure_microvm_kernel_config_file() {
+  local config_path="$1"
+  KERNEL_CONFIG_PATH="$config_path" python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path(os.environ["KERNEL_CONFIG_PATH"])
+text = path.read_text(encoding="utf-8")
+required = (
+    "VIRTIO",
+    "VIRTIO_BLK",
+    "VIRTIO_NET",
+    "VIRTIO_MMIO",
+    "VIRTIO_MMIO_CMDLINE_DEVICES",
+    "EXT4_FS",
+    "DEVTMPFS",
+    "DEVTMPFS_MOUNT",
+    "NET_NS",
+    "VETH",
+    "BRIDGE",
+    "BRIDGE_NETFILTER",
+    "NETFILTER",
+    "NF_CONNTRACK",
+    "NF_NAT",
+    "NETFILTER_XTABLES",
+    "NETFILTER_XT_MATCH_CONNTRACK",
+    "IP_NF_IPTABLES",
+    "IP_NF_FILTER",
+    "IP_NF_NAT",
+    "IP_NF_RAW",
+)
+for name in required:
+    pattern = re.compile(
+        rf"^(?:CONFIG_{re.escape(name)}=.*|# CONFIG_{re.escape(name)} is not set)\n?",
+        re.MULTILINE,
+    )
+    text = pattern.sub("", text)
+    text += f"CONFIG_{name}=y\n"
+path.write_text(text, encoding="utf-8")
+PY
 }
 
 write_kernel_manifest() {
@@ -166,12 +226,14 @@ build_ubuntu_kernel() {
 
   ubuntu_src="$work_dir/ubuntu-linux-$resolved_tag"
   if [ ! -d "$ubuntu_src/.git" ]; then
-    git clone --depth 1 --branch "$resolved_tag" "$ubuntu_kernel_repo" "$ubuntu_src"
+    git -c core.autocrlf=false clone --depth 1 --branch "$resolved_tag" "$ubuntu_kernel_repo" "$ubuntu_src"
   else
     git -C "$ubuntu_src" fetch --depth 1 origin "$resolved_tag"
     git -C "$ubuntu_src" checkout --detach FETCH_HEAD
   fi
+  git -C "$ubuntu_src" config core.autocrlf false
   git -C "$ubuntu_src" reset --hard HEAD >/dev/null
+  git -C "$ubuntu_src" archive HEAD | tar -x -C "$ubuntu_src"
   cp "$config_path" "$ubuntu_src/.config"
   ensure_microvm_kernel_config "$ubuntu_src"
 
@@ -192,7 +254,17 @@ build_ubuntu_kernel() {
       apt-get install -y --no-install-recommends \
         bc bison build-essential ca-certificates dwarves flex git libelf-dev libssl-dev rsync
       make ARCH=x86_64 olddefconfig
-      grep -q "^CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y$" .config
+      for symbol in \
+        VIRTIO VIRTIO_BLK VIRTIO_NET VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES \
+        EXT4_FS DEVTMPFS DEVTMPFS_MOUNT NET_NS VETH BRIDGE BRIDGE_NETFILTER \
+        NETFILTER NF_CONNTRACK NF_NAT NETFILTER_XTABLES \
+        NETFILTER_XT_MATCH_CONNTRACK IP_NF_IPTABLES IP_NF_FILTER IP_NF_NAT IP_NF_RAW
+      do
+        grep -q "^CONFIG_${symbol}=y$" .config || {
+          echo "required kernel configuration was dropped: CONFIG_${symbol}" >&2
+          exit 1
+        }
+      done
       make ARCH=x86_64 -j"$(nproc)" vmlinux
       grep -aq "virtio_mmio.device" vmlinux
       install -m 0644 vmlinux /out/vmlinux
@@ -230,6 +302,7 @@ PY
 
 build_firecracker_ci_kernel() {
   local src_dir
+  local config_path
   echo "Kernel provider: firecracker-ci"
   echo "Firecracker ref: $firecracker_ref"
   echo "Kernel version: $firecracker_config_version"
@@ -245,6 +318,17 @@ build_firecracker_ci_kernel() {
 
   mkdir -p "$work_dir" "$version_dir"
   src_dir="$(clone_firecracker_config_source)"
+  config_path="$src_dir/resources/guest_configs/microvm-kernel-ci-$arch-$firecracker_config_version.config"
+  if [ ! -f "$config_path" ]; then
+    echo "Firecracker guest kernel config not found: $config_path" >&2
+    exit 1
+  fi
+  # Firecracker's 5.10-no-acpi config omits the legacy IPv4 raw table. Docker
+  # uses that table for direct-access filtering on user-defined networks, so
+  # patch the config consumed by rebuild.sh rather than only the Ubuntu test
+  # provider's source tree.
+  ensure_microvm_kernel_config_file "$config_path"
+  grep -q '^CONFIG_IP_NF_RAW=y$' "$config_path"
   if [ "$skip_vmclock" = "1" ]; then
     patch_firecracker_rebuild_for_no_vmclock "$src_dir"
   fi

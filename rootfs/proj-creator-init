@@ -13,6 +13,7 @@ chown appuser:appuser /workspace /var/lib/proj-creator 2>/dev/null || true
 
 ip link set lo up 2>/dev/null || true
 ip link set eth0 up 2>/dev/null || true
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 
 if [ -x /usr/sbin/sshd ]; then
   ssh-keygen -A >/dev/null 2>&1 || true
@@ -29,11 +30,23 @@ fi
 
 if [ -x /usr/bin/dockerd ]; then
   mkdir -p /var/lib/docker
+  # The released guest kernel intentionally omits nftables. Ubuntu installs
+  # the nft frontend as the default `iptables` alternative, which makes
+  # dockerd's bridge driver fail with "Protocol not supported" even though
+  # the kernel's legacy xtables support is available.
+  if command -v update-alternatives >/dev/null 2>&1; then
+    if [ -x /usr/sbin/iptables-legacy ]; then
+      update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null
+    fi
+    if [ -x /usr/sbin/ip6tables-legacy ]; then
+      update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null
+    fi
+  fi
   /usr/bin/dockerd \
     --host=unix:///var/run/docker.sock \
     --containerd=/run/containerd/containerd.sock \
-    --iptables=false \
-    --bridge=none \
+    --iptables=true \
+    --ip-forward=true \
     --userland-proxy=false \
     >/var/log/proj-creator-dockerd.log 2>&1 &
 fi

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import select
+import signal
 import shlex
 import shutil
 import socket
@@ -25,6 +26,19 @@ def emit_status(phase, message):
         "phase": phase,
         "message": message,
     }, separators=(",", ":")), flush=True)
+
+
+class RunnerInterrupted(Exception):
+    def __init__(self, signum):
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
+
+
+def raise_runner_interrupted(signum, _frame):
+    # Do not let a second termination signal interrupt resource cleanup. The
+    # caller may still use SIGKILL after its grace period.
+    signal.signal(signum, signal.SIG_IGN)
+    raise RunnerInterrupted(signum)
 
 
 def fail(message, code=70):
@@ -135,6 +149,27 @@ def wait_for_ssh(ssh_base, seconds):
 
 def ssh_command(ssh_base, script, *, check=True, stdout=None, stdin=None):
     return run([*ssh_base, "bash", "-lc", shlex.quote(script)], check=check, stdout=stdout, stdin=stdin)
+
+
+def ssh_output(ssh_base, script):
+    command = [*ssh_base, "bash", "-lc", shlex.quote(script)]
+    log("+ " + format_command(command))
+    result = subprocess.run(command, check=False, stdout=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        fail(f"command failed with exit code {result.returncode}: {format_command(command)}")
+    return result.stdout
+
+
+def docker_service_args(required, socket_gid):
+    if not required:
+        return []
+    socket_gid = str(socket_gid).strip()
+    if not socket_gid.isdigit():
+        fail(f"guest Docker socket has invalid group id: {socket_gid!r}")
+    return [
+        "-v", "/var/run/docker.sock:/var/run/docker.sock",
+        "--group-add", socket_gid,
+    ]
 
 
 def terminate_process(process, name):
@@ -369,20 +404,23 @@ def ensure_iptables_rule(table, chain, rule):
     if table:
         check_args.extend(["-t", table])
     check_args.extend(["-C", chain, *rule])
+    delete_args = []
+    if table:
+        delete_args.extend(["-t", table])
+    delete_args.extend(["-D", chain, *rule])
+    cleanup_command = ["iptables", *delete_args]
     if iptables_rule_exists(check_args):
-        return None
+        # The rule is namespaced by this deterministic per-run tap/subnet. It
+        # can be left behind by an earlier hard kill, so the current run owns
+        # removing it even when it did not need to recreate it.
+        return cleanup_command
 
     add_args = []
     if table:
         add_args.extend(["-t", table])
     add_args.extend(["-A", chain, *rule])
     run_privileged(["iptables", *add_args])
-
-    delete_args = []
-    if table:
-        delete_args.extend(["-t", table])
-    delete_args.extend(["-D", chain, *rule])
-    return ["iptables", *delete_args]
+    return cleanup_command
 
 
 def setup_guest_nat(tap, host_ip):
@@ -391,18 +429,20 @@ def setup_guest_nat(tap, host_ip):
     subnet = guest_subnet(host_ip)
     run_privileged(["sysctl", "-w", "net.ipv4.ip_forward=1"])
     cleanup = []
-    for table, chain, rule in [
-        ("nat", "POSTROUTING", ["-s", subnet, "!", "-o", tap, "-j", "MASQUERADE"]),
-        (None, "FORWARD", ["-i", tap, "-j", "ACCEPT"]),
-        (
-            None,
-            "FORWARD",
-            ["-o", tap, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
-        ),
-    ]:
-        delete_command = ensure_iptables_rule(table, chain, rule)
-        if delete_command is not None:
-            cleanup.append(delete_command)
+    try:
+        for table, chain, rule in [
+            ("nat", "POSTROUTING", ["-s", subnet, "!", "-o", tap, "-j", "MASQUERADE"]),
+            (None, "FORWARD", ["-i", tap, "-j", "ACCEPT"]),
+            (
+                None,
+                "FORWARD",
+                ["-o", tap, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+            ),
+        ]:
+            cleanup.append(ensure_iptables_rule(table, chain, rule))
+    except BaseException:
+        cleanup_guest_nat(cleanup)
+        raise
     log(f"guest NAT enabled for {subnet} via {tap}")
     return cleanup
 
@@ -617,6 +657,9 @@ def main():
     loopback_proxies = []
     nat_cleanup = []
     exit_code = 1
+    previous_signal_handlers = {}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous_signal_handlers[signum] = signal.signal(signum, raise_runner_interrupted)
     try:
         emit_status("setup", "Configuring Firecracker network")
         # A killed runner can leave the deterministic per-run tap behind. Drop
@@ -704,6 +747,10 @@ def main():
             ssh_base,
             "for i in $(seq 1 120); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1",
         )
+        docker_socket_gid = ssh_output(
+            root_ssh_base,
+            "test -S /var/run/docker.sock && stat -c %g /var/run/docker.sock",
+        ).strip()
         emit_status("run", "Loading agent image into guest")
         log(f"loading agent image into guest: {selected_image}")
         load_docker_image_to_guest(ssh_base, selected_image)
@@ -735,6 +782,7 @@ def main():
             "-v", f"{guest_workspace}:{workspace_target}",
             "-w", workspace_target,
             *guest_mounts,
+            *docker_service_args(request.get("docker_service_required"), docker_socket_gid),
         ]
         for dns_server in dns_servers:
             docker_args.extend(["--dns", dns_server])
@@ -792,6 +840,9 @@ def main():
             "|| poweroff || shutdown -h now || halt -f || true"
         )
         run(["timeout", "8", *root_ssh_base, "bash", "-lc", shlex.quote(shutdown_script)], check=False)
+    except RunnerInterrupted as interrupted:
+        exit_code = 128 + interrupted.signum
+        log(f"received signal {interrupted.signum}; cleaning up Firecracker resources")
     finally:
         if firecracker_process:
             try:
@@ -813,6 +864,8 @@ def main():
             run_privileged(["ip", "link", "del", tap], check=False)
         cleanup_guest_nat(nat_cleanup)
         stop_loopback_proxies(loopback_proxies)
+        for signum, previous in previous_signal_handlers.items():
+            signal.signal(signum, previous)
 
     raise SystemExit(exit_code)
 

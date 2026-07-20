@@ -18,3 +18,13 @@ The runner stages the host workspace into the guest over SSH, runs the selected
 agent Docker image inside the VM after loading it from the host Docker daemon,
 then syncs the workspace back while excluding `.git` so host Git metadata is not
 overwritten by the guest copy.
+
+When the request sets `docker_service_required: true`, the runner mounts the
+guest's `/var/run/docker.sock` into the agent container and adds the socket's
+numeric group ID to the container process. This exposes only the disposable
+guest Docker daemon; the executor host Docker socket is never mounted into the
+microVM or agent container.
+
+The guest init starts Docker with its bridge and iptables networking enabled so
+agent-started application and dependency containers can use ordinary Docker
+networks and Compose-style service discovery inside the microVM.
