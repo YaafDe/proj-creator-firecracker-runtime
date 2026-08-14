@@ -65,12 +65,13 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version }}
-          name: ${{ inputs.version }}
+          tag_name: ${{ inputs.version || github.ref_name }}
+          name: ${{ inputs.version || github.ref_name }}
           generate_release_notes: false
+          fail_on_unmatched_files: true
           files: |
-            artifacts/${{ inputs.version }}/manifest.json
-            artifacts/${{ inputs.version }}/SHA256SUMS
-            artifacts/${{ inputs.version }}/vmlinux.zst
-            artifacts/${{ inputs.version }}/rootfs.ext4.zst
-            artifacts/${{ inputs.version }}/firecracker-runner.zst
+            artifacts/${{ inputs.version || github.ref_name }}/manifest.json
+            artifacts/${{ inputs.version || github.ref_name }}/SHA256SUMS
+            artifacts/${{ inputs.version || github.ref_name }}/vmlinux.zst
+            artifacts/${{ inputs.version || github.ref_name }}/rootfs.ext4.zst
+            artifacts/${{ inputs.version || github.ref_name }}/firecracker-runner.zst
