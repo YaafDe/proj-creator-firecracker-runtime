@@ -107,9 +107,9 @@ consumes immutable release manifest URLs, so updating an existing worker fleet
 means publishing a fresh runtime version and running `install-worker` with the
 new manifest URL.
 
-For urgent kernel CVEs, run the normal **Actions > release > Run workflow**
-after Ubuntu publishes a fixed Noble kernel tag and choose a fresh version such
-as `v2026.05.12-security.1`. If you need a specific fixed tag, pin
+For urgent kernel CVEs, push a fresh version tag such as
+`v2026.05.12-security.1`, or run **Actions > release > Run workflow**, after
+Ubuntu publishes a fixed Noble kernel tag. If you need a specific fixed tag, pin
 `PROJ_CREATOR_UBUNTU_KERNEL_TAG` in `scripts/build-kernel.sh` through a reviewed
 commit before running the same release workflow. Do not mutate assets under an
 existing release tag.
@@ -131,13 +131,21 @@ artifacts/v2026.05.0/SHA256SUMS
 
 ## One-Click Release In GitHub Actions
 
-Open **Actions > release > Run workflow** and fill in:
+Push an immutable version tag to publish without requiring an external Actions
+API credential:
+
+```bash
+git tag v2026.05.0
+git push origin v2026.05.0
+```
+
+Alternatively, open **Actions > release > Run workflow** and fill in:
 
 - `version`, for example `v2026.05.0`
 
-That is the only release form input. The workflow builds the kernel, builds the
-rootfs, packages the runner, renders `manifest.json`, and publishes all release
-assets to GitHub Releases. The
+That is the only release form input. Both triggers run the same workflow, which
+builds the kernel, builds the rootfs, packages the runner, renders
+`manifest.json`, and publishes all release assets to GitHub Releases. The
 manifest URL for worker setup is then:
 
 ```text
