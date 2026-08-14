@@ -195,6 +195,26 @@ def ssh_output(ssh_base, script):
     return result.stdout.decode("utf-8", errors="replace")
 
 
+def write_guest_file(ssh_base, destination, contents, mode="0600"):
+    destination_q = shlex.quote(destination)
+    mode_q = shlex.quote(mode)
+    script = f"umask 077; cat > {destination_q}; chmod {mode_q} {destination_q}"
+    return run(
+        [*ssh_base, "bash", "-lc", shlex.quote(script)],
+        input_data=contents,
+    )
+
+
+def stage_agent_script(ssh_base, agent_container_name, inner_script):
+    guest_path = f"/tmp/{agent_container_name}-inner-script.sh"
+    container_path = "/tmp/proj-creator-inner-script.sh"
+    write_guest_file(ssh_base, guest_path, inner_script.encode("utf-8"))
+    return (
+        ["-v", f"{guest_path}:{container_path}:ro"],
+        ["/bin/bash", "-l", container_path],
+    )
+
+
 def docker_service_args(required, socket_gid):
     if not required:
         return []
@@ -854,6 +874,11 @@ def run_request(request):
 
         container_suffix = re.sub(r"[^a-zA-Z0-9_.-]", "-", str(request.get("message_id") or "run"))[:48]
         agent_container_name = f"proj-creator-agent-{container_suffix}"
+        agent_script_mount, agent_script_command = stage_agent_script(
+            ssh_base,
+            agent_container_name,
+            inner_script,
+        )
         docker_args = [
             "docker", "run",
             "--name", agent_container_name,
@@ -862,6 +887,7 @@ def run_request(request):
             "-v", f"{guest_workspace}:{workspace_target}",
             "-w", workspace_target,
             *guest_mounts,
+            *agent_script_mount,
             *docker_service_args(request.get("docker_service_required"), docker_socket_gid),
         ]
         for dns_server in dns_servers:
@@ -870,7 +896,7 @@ def run_request(request):
             docker_args.extend(["-e", f"{key}={value}"])
         if request.get("extra_docker_args"):
             docker_args.extend(shlex.split(request["extra_docker_args"]))
-        docker_args.extend([selected_image, "/bin/bash", "-lc", inner_script])
+        docker_args.extend([selected_image, *agent_script_command])
 
         container_name_q = shlex.quote(agent_container_name)
         remote_script = "\n".join([

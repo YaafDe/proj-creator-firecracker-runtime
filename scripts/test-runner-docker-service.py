@@ -160,6 +160,61 @@ class SshCommandTransportTests(unittest.TestCase):
             input_data=script.encode("utf-8"),
         )
 
+    def test_large_agent_script_is_staged_instead_of_added_to_docker_argv(self):
+        script = "printf x\n" * 20000
+        ssh_base = ["ssh", "appuser@guest"]
+
+        with mock.patch.object(module, "write_guest_file") as write_guest_file:
+            mount_args, command_args = module.stage_agent_script(
+                ssh_base,
+                "proj-creator-agent-message-1",
+                script,
+            )
+
+        write_guest_file.assert_called_once_with(
+            ssh_base,
+            "/tmp/proj-creator-agent-message-1-inner-script.sh",
+            script.encode("utf-8"),
+        )
+        self.assertEqual(
+            mount_args,
+            [
+                "-v",
+                "/tmp/proj-creator-agent-message-1-inner-script.sh:/tmp/proj-creator-inner-script.sh:ro",
+            ],
+        )
+        self.assertEqual(
+            command_args,
+            ["/bin/bash", "-l", "/tmp/proj-creator-inner-script.sh"],
+        )
+        self.assertNotIn(script, mount_args + command_args)
+
+    def test_guest_file_contents_are_streamed_instead_of_added_to_argv(self):
+        contents = b"x" * (256 * 1024)
+        ssh_base = ["ssh", "appuser@guest"]
+
+        with mock.patch.object(module, "run") as run:
+            module.write_guest_file(
+                ssh_base,
+                "/tmp/proj-creator-agent-script.sh",
+                contents,
+            )
+
+        command = run.call_args.args[0]
+        self.assertNotIn(contents.decode("utf-8"), command)
+        run.assert_called_once_with(
+            [
+                *ssh_base,
+                "bash",
+                "-lc",
+                module.shlex.quote(
+                    "umask 077; cat > /tmp/proj-creator-agent-script.sh; "
+                    "chmod 0600 /tmp/proj-creator-agent-script.sh"
+                ),
+            ],
+            input_data=contents,
+        )
+
 
 class NetworkCleanupTests(unittest.TestCase):
     def test_preexisting_per_run_rule_is_still_owned_for_cleanup(self):
