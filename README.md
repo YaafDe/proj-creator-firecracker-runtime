@@ -176,9 +176,12 @@ of an immutable agent Docker image, the runner serializes preparation with a
 per-image lock, boots a temporary VM from a COW clone of the generic rootfs,
 imports the image, shuts down cleanly, removes the temporary SSH key, and
 atomically publishes a prepared rootfs plus marker. Normal runs reflink-clone
-that project/image/template-scoped rootfs and verify the expected Docker image
-ID inside the guest before skipping transfer. A missing or invalid snapshot
-falls back to `docker save` / `docker load` and invalidates the marker.
+that project/image/template-scoped rootfs and verify the recorded guest Docker
+image ID before skipping transfer. The immutable host image ID remains the
+cache key, while the marker separately records the ID reported by the guest's
+`docker load`; different Docker versions may legitimately assign different
+config IDs during this transfer. A missing or invalid snapshot falls back to
+`docker save` / `docker load` and invalidates the marker.
 
 The runner expects the host to provide `docker`, `firecracker`, `ip`, `ssh`,
 `ssh-keygen`, `tar`, `mount`, `umount`, and either root privileges or

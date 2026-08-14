@@ -74,7 +74,7 @@ class GuestImageStagingTests(unittest.TestCase):
         with mock.patch.object(module, "emit_status"), mock.patch.object(
             module,
             "guest_docker_image_id",
-            return_value=None,
+            side_effect=[None, "sha256:guest"],
         ), mock.patch.object(
             module,
             "load_docker_image_to_guest",
@@ -92,6 +92,7 @@ class GuestImageStagingTests(unittest.TestCase):
             "chown_guest_workspace",
             operations.chown_guest_workspace,
         ):
+            operations.load_image.return_value = ("sha256:guest", [])
             module.load_image_and_stage_workspace(
                 ssh_base,
                 root_ssh_base,
@@ -111,6 +112,67 @@ class GuestImageStagingTests(unittest.TestCase):
                     "proj-creator-agent:test",
                     "sha256:expected",
                 ),
+                mock.call.wait_for_ssh(ssh_base, 120),
+                mock.call.tar_to_guest(ssh_base, repo, "/workspace"),
+                mock.call.chown_guest_workspace(
+                    root_ssh_base,
+                    "/workspace",
+                    10001,
+                    10001,
+                ),
+            ],
+        )
+
+    def test_imported_guest_id_is_used_when_docker_rewrites_the_host_id(self):
+        operations = mock.Mock()
+        ssh_base = ["ssh", "appuser@guest"]
+        root_ssh_base = ["ssh", "root@guest"]
+        repo = pathlib.Path("/tmp/repo")
+        host_id = "sha256:" + "a" * 64
+        guest_id = "sha256:" + "b" * 64
+
+        with mock.patch.object(module, "emit_status"), mock.patch.object(
+            module,
+            "guest_docker_image_id",
+            side_effect=[None, guest_id],
+        ), mock.patch.object(
+            module,
+            "load_docker_image_to_guest",
+            return_value=(guest_id, []),
+        ) as load_image, mock.patch.object(
+            module,
+            "wait_for_ssh",
+            operations.wait_for_ssh,
+        ), mock.patch.object(
+            module,
+            "tar_to_guest",
+            operations.tar_to_guest,
+        ), mock.patch.object(
+            module,
+            "chown_guest_workspace",
+            operations.chown_guest_workspace,
+        ):
+            resolved = module.load_image_and_stage_workspace(
+                ssh_base,
+                root_ssh_base,
+                "proj-creator-agent:test",
+                repo,
+                "/workspace",
+                10001,
+                10001,
+                host_id,
+                expected_guest_image_id=guest_id,
+            )
+
+        self.assertEqual(resolved, guest_id)
+        load_image.assert_called_once_with(
+            ssh_base,
+            "proj-creator-agent:test",
+            host_id,
+        )
+        self.assertEqual(
+            operations.mock_calls,
+            [
                 mock.call.wait_for_ssh(ssh_base, 120),
                 mock.call.tar_to_guest(ssh_base, repo, "/workspace"),
                 mock.call.chown_guest_workspace(
@@ -180,7 +242,8 @@ class PreparedImageCacheTests(unittest.TestCase):
             warm_dir = pathlib.Path(directory)
             (warm_dir / "rootfs.ext4").write_bytes(b"prepared")
             (warm_dir / "prepared.json").write_text(
-                '{"selected_image_id":"sha256:image-a"}',
+                '{"selected_image_id":"sha256:image-a",'
+                '"guest_image_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
                 encoding="utf-8",
             )
 
@@ -190,6 +253,34 @@ class PreparedImageCacheTests(unittest.TestCase):
             self.assertFalse(
                 module.prepared_image_cache_ready(warm_dir, "sha256:image-b")
             )
+
+    def test_legacy_cache_without_guest_image_id_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            warm_dir = pathlib.Path(directory)
+            (warm_dir / "rootfs.ext4").write_bytes(b"prepared")
+            (warm_dir / "prepared.json").write_text(
+                '{"selected_image_id":"sha256:image-a"}',
+                encoding="utf-8",
+            )
+
+            self.assertFalse(
+                module.prepared_image_cache_ready(warm_dir, "sha256:image-a")
+            )
+
+
+class DockerLoadOutputTests(unittest.TestCase):
+    def test_parses_guest_id_rewritten_during_cross_version_load(self):
+        guest_id = "sha256:" + "b" * 64
+        self.assertEqual(
+            module.parse_docker_load_output(f"Loaded image ID: {guest_id}\n"),
+            (guest_id, []),
+        )
+
+    def test_parses_loaded_tag_as_fallback_reference(self):
+        self.assertEqual(
+            module.parse_docker_load_output("Loaded image: proj-creator-agent:test\n"),
+            (None, ["proj-creator-agent:test"]),
+        )
 
 
 class SshCommandTransportTests(unittest.TestCase):

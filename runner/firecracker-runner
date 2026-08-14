@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -356,46 +357,82 @@ def sync_mount_back_to_host(root_ssh_base, mount, uid, gid):
     chown_host_path(host_path, uid, gid)
 
 
+def parse_docker_load_output(output):
+    loaded_image_id = None
+    loaded_references = []
+    for line in output.splitlines():
+        if line.startswith("Loaded image ID: "):
+            candidate = line.removeprefix("Loaded image ID: ").strip()
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", candidate):
+                loaded_image_id = candidate
+        elif line.startswith("Loaded image: "):
+            candidate = line.removeprefix("Loaded image: ").strip()
+            if candidate:
+                loaded_references.append(candidate)
+    return loaded_image_id, loaded_references
+
+
+def resolve_loaded_guest_image(ssh_base, selected_image, load_result):
+    loaded_image_id, loaded_references = load_result
+    candidates = [loaded_image_id, *loaded_references, selected_image]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        guest_image_id = guest_docker_image_id(ssh_base, candidate)
+        if guest_image_id:
+            return guest_image_id
+    fail(f"guest Docker did not retain the imported image: {selected_image}")
+
+
 def load_docker_image_to_guest(ssh_base, image, image_id=None):
     source_image = image_id or image
     run(["docker", "image", "inspect", source_image], stdout=subprocess.DEVNULL)
     timeout_seconds = int(os.environ.get("PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS", "900"))
     save = subprocess.Popen(["docker", "save", source_image], stdout=subprocess.PIPE)
     ssh = None
-    try:
-        ssh = subprocess.Popen(
-            [*ssh_base, "bash", "-lc", shlex.quote("docker load")],
-            stdin=save.stdout,
-        )
-        if save.stdout:
-            save.stdout.close()
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            save_status = save.poll()
-            ssh_status = ssh.poll()
-            if save_status is not None and ssh_status is not None:
-                break
-            if time.monotonic() > deadline:
-                terminate_process(save, "docker save")
+    with tempfile.TemporaryFile() as guest_stdout:
+        try:
+            ssh = subprocess.Popen(
+                [*ssh_base, "bash", "-lc", shlex.quote("docker load")],
+                stdin=save.stdout,
+                stdout=guest_stdout,
+            )
+            if save.stdout:
+                save.stdout.close()
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                save_status = save.poll()
+                ssh_status = ssh.poll()
+                if save_status is not None and ssh_status is not None:
+                    break
+                if time.monotonic() > deadline:
+                    terminate_process(save, "docker save")
+                    terminate_process(ssh, "guest docker load")
+                    fail(f"timed out after {timeout_seconds}s loading Docker image into guest: {image}")
+                time.sleep(0.5)
+        finally:
+            if save.stdout:
+                save.stdout.close()
+            if ssh is not None:
                 terminate_process(ssh, "guest docker load")
-                fail(f"timed out after {timeout_seconds}s loading Docker image into guest: {image}")
-            time.sleep(0.5)
-    finally:
-        if save.stdout:
-            save.stdout.close()
-        if ssh is not None:
-            terminate_process(ssh, "guest docker load")
-    status = save.wait()
-    if status != 0:
-        fail(f"docker save failed with exit code {status}: {image}")
-    ssh_status = ssh.wait() if ssh is not None else 1
-    if ssh_status != 0:
-        fail(f"guest docker load failed with exit code {ssh_status}: {image}")
-    if image_id:
-        ssh_command(
-            ssh_base,
-            f"docker image tag {shlex.quote(image_id)} {shlex.quote(image)}",
-        )
+        status = save.wait()
+        if status != 0:
+            fail(f"docker save failed with exit code {status}: {image}")
+        ssh_status = ssh.wait() if ssh is not None else 1
+        if ssh_status != 0:
+            fail(f"guest docker load failed with exit code {ssh_status}: {image}")
+        guest_stdout.seek(0)
+        load_output = guest_stdout.read().decode("utf-8", errors="replace")
+
+    for line in load_output.splitlines():
+        try:
+            print(line, flush=True)
+        except BrokenPipeError:
+            break
+    load_result = parse_docker_load_output(load_output)
+    if not load_result[0] and not load_result[1]:
+        fail(f"guest docker load did not report an imported image: {image}")
+    return load_result
 
 
 def host_docker_image_id(image):
@@ -431,11 +468,19 @@ def load_image_and_stage_workspace(
     workspace_gid,
     selected_image_id=None,
     warm_dir=None,
+    expected_guest_image_id=None,
 ):
-    guest_image_id = guest_docker_image_id(ssh_base, image)
-    if selected_image_id and guest_image_id == selected_image_id:
+    guest_image_id = None
+    if expected_guest_image_id:
+        guest_image_id = guest_docker_image_id(ssh_base, expected_guest_image_id)
+    elif selected_image_id:
+        candidate = guest_docker_image_id(ssh_base, image)
+        if candidate == selected_image_id:
+            guest_image_id = candidate
+
+    if guest_image_id:
         emit_status("run", "Using prepared agent image snapshot")
-        log(f"agent image already present in guest: {image} ({selected_image_id})")
+        log(f"agent image already present in guest: {image} ({guest_image_id})")
     else:
         if warm_dir is not None and Path(warm_dir, "prepared.json").exists():
             log("prepared agent image snapshot did not contain the expected image; invalidating it")
@@ -444,12 +489,13 @@ def load_image_and_stage_workspace(
             except FileNotFoundError:
                 pass
         log(f"loading agent image into guest: {image}")
-        load_docker_image_to_guest(ssh_base, image, selected_image_id)
+        load_result = load_docker_image_to_guest(ssh_base, image, selected_image_id)
 
         # Importing a large image can leave the guest CPU and filesystem busy
         # long enough for sshd to miss the short per-attempt SSH banner timeout.
         emit_status("run", "Waiting for guest SSH after image load")
         wait_for_ssh(ssh_base, 120)
+        guest_image_id = resolve_loaded_guest_image(ssh_base, image, load_result)
 
     emit_status("workspace", "Staging workspace into guest")
     log(f"staging workspace into guest {guest_workspace}")
@@ -460,6 +506,7 @@ def load_image_and_stage_workspace(
         workspace_uid,
         workspace_gid,
     )
+    return guest_image_id
 
 
 def parse_size(value):
@@ -511,17 +558,26 @@ def clone_rootfs(source, destination):
     return "copy"
 
 
-def prepared_image_cache_ready(warm_dir, selected_image_id):
+def prepared_image_cache_metadata(warm_dir, selected_image_id):
     warm_dir = Path(warm_dir)
     rootfs = warm_dir / "rootfs.ext4"
     marker = warm_dir / "prepared.json"
     if not rootfs.is_file() or not marker.is_file():
-        return False
+        return None
     try:
         metadata = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
-    return metadata.get("selected_image_id") == selected_image_id
+        return None
+    if metadata.get("selected_image_id") != selected_image_id:
+        return None
+    guest_image_id = metadata.get("guest_image_id")
+    if not isinstance(guest_image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", guest_image_id):
+        return None
+    return metadata
+
+
+def prepared_image_cache_ready(warm_dir, selected_image_id):
+    return prepared_image_cache_metadata(warm_dir, selected_image_id) is not None
 
 
 def replace_run_rootfs_from_cache(rootfs, warm_dir):
@@ -925,14 +981,9 @@ def prepare_agent_image_snapshot(
             "for i in $(seq 1 120); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1",
         )
         emit_status("setup", "Importing agent image into reusable snapshot")
-        load_docker_image_to_guest(ssh_base, selected_image, selected_image_id)
+        load_result = load_docker_image_to_guest(ssh_base, selected_image, selected_image_id)
         wait_for_ssh(ssh_base, 120)
-        prepared_id = guest_docker_image_id(ssh_base, selected_image)
-        if prepared_id != selected_image_id:
-            fail(
-                "prepared guest Docker image ID did not match host image: "
-                f"expected {selected_image_id}, got {prepared_id or 'missing'}"
-            )
+        prepared_id = resolve_loaded_guest_image(ssh_base, selected_image, load_result)
         run(
             ["timeout", "15", *root_ssh_base, "bash", "-lc", shlex.quote(guest_shutdown_script())],
             check=False,
@@ -973,9 +1024,10 @@ def prepare_agent_image_snapshot(
             pass
     clone_mode = clone_rootfs(rootfs, temporary_rootfs)
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "selected_image": selected_image,
         "selected_image_id": selected_image_id,
+        "guest_image_id": prepared_id,
         "clone_mode": clone_mode,
         "prepared_at_unix": int(time.time()),
     }
@@ -1034,7 +1086,8 @@ def run_request(request):
     cache_lock_path = warm_dir / "prepare.lock"
     with cache_lock_path.open("a+b") as cache_lock:
         fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
-        if prepared_image_cache_ready(warm_dir, selected_image_id):
+        cache_metadata = prepared_image_cache_metadata(warm_dir, selected_image_id)
+        if cache_metadata is not None:
             emit_status("setup", "Cloning prepared agent image snapshot")
             replace_run_rootfs_from_cache(rootfs, warm_dir)
         else:
@@ -1051,7 +1104,11 @@ def run_request(request):
                 selected_image_id,
             )
             replace_run_rootfs_from_cache(rootfs, warm_dir)
+            cache_metadata = prepared_image_cache_metadata(warm_dir, selected_image_id)
+            if cache_metadata is None:
+                fail("published agent image snapshot metadata could not be read back")
         fcntl.flock(cache_lock.fileno(), fcntl.LOCK_UN)
+    expected_guest_image_id = cache_metadata["guest_image_id"]
     run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)])
     public_key = key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
     emit_status("setup", "Injecting guest SSH key")
@@ -1163,7 +1220,7 @@ def run_request(request):
 
         workspace_target = container_workspace_target(workdir)
         guest_workspace = workspace_target
-        load_image_and_stage_workspace(
+        guest_agent_image = load_image_and_stage_workspace(
             ssh_base,
             root_ssh_base,
             selected_image,
@@ -1173,6 +1230,7 @@ def run_request(request):
             workspace_gid,
             selected_image_id,
             warm_dir,
+            expected_guest_image_id,
         )
 
         guest_mounts = []
@@ -1210,7 +1268,7 @@ def run_request(request):
             docker_args.extend(["-e", f"{key}={value}"])
         if request.get("extra_docker_args"):
             docker_args.extend(shlex.split(request["extra_docker_args"]))
-        docker_args.extend([selected_image, *agent_script_command])
+        docker_args.extend([guest_agent_image, *agent_script_command])
 
         container_name_q = shlex.quote(agent_container_name)
         remote_script = "\n".join([
