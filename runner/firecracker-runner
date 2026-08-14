@@ -1031,8 +1031,6 @@ def run_request(request):
         except FileNotFoundError:
             pass
 
-    emit_status("setup", "Preparing Firecracker rootfs")
-    grow_rootfs(rootfs)
     cache_lock_path = warm_dir / "prepare.lock"
     with cache_lock_path.open("a+b") as cache_lock:
         fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
@@ -1040,6 +1038,8 @@ def run_request(request):
             emit_status("setup", "Cloning prepared agent image snapshot")
             replace_run_rootfs_from_cache(rootfs, warm_dir)
         else:
+            emit_status("setup", "Growing generic rootfs for first-use preparation")
+            grow_rootfs(rootfs)
             emit_status("setup", "Preparing reusable agent image snapshot on first use")
             prepare_agent_image_snapshot(
                 firecracker,
