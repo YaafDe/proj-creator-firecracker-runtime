@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import fcntl
 import hashlib
 import http.client
 import json
@@ -355,10 +356,11 @@ def sync_mount_back_to_host(root_ssh_base, mount, uid, gid):
     chown_host_path(host_path, uid, gid)
 
 
-def load_docker_image_to_guest(ssh_base, image):
-    run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL)
+def load_docker_image_to_guest(ssh_base, image, image_id=None):
+    source_image = image_id or image
+    run(["docker", "image", "inspect", source_image], stdout=subprocess.DEVNULL)
     timeout_seconds = int(os.environ.get("PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS", "900"))
-    save = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+    save = subprocess.Popen(["docker", "save", source_image], stdout=subprocess.PIPE)
     ssh = None
     try:
         ssh = subprocess.Popen(
@@ -389,6 +391,34 @@ def load_docker_image_to_guest(ssh_base, image):
     ssh_status = ssh.wait() if ssh is not None else 1
     if ssh_status != 0:
         fail(f"guest docker load failed with exit code {ssh_status}: {image}")
+    if image_id:
+        ssh_command(
+            ssh_base,
+            f"docker image tag {shlex.quote(image_id)} {shlex.quote(image)}",
+        )
+
+
+def host_docker_image_id(image):
+    result = run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        stdout=subprocess.PIPE,
+    )
+    image_id = result.stdout.decode("utf-8", errors="replace").strip()
+    if not image_id:
+        fail(f"Docker returned an empty immutable image ID for {image}")
+    return image_id
+
+
+def guest_docker_image_id(ssh_base, image):
+    result = ssh_command(
+        ssh_base,
+        f"docker image inspect --format '{{{{.Id}}}}' {shlex.quote(image)}",
+        check=False,
+        stdout=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", errors="replace").strip() or None
 
 
 def load_image_and_stage_workspace(
@@ -399,16 +429,27 @@ def load_image_and_stage_workspace(
     guest_workspace,
     workspace_uid,
     workspace_gid,
+    selected_image_id=None,
+    warm_dir=None,
 ):
-    log(f"loading agent image into guest: {image}")
-    load_docker_image_to_guest(ssh_base, image)
+    guest_image_id = guest_docker_image_id(ssh_base, image)
+    if selected_image_id and guest_image_id == selected_image_id:
+        emit_status("run", "Using prepared agent image snapshot")
+        log(f"agent image already present in guest: {image} ({selected_image_id})")
+    else:
+        if warm_dir is not None and Path(warm_dir, "prepared.json").exists():
+            log("prepared agent image snapshot did not contain the expected image; invalidating it")
+            try:
+                Path(warm_dir, "prepared.json").unlink()
+            except FileNotFoundError:
+                pass
+        log(f"loading agent image into guest: {image}")
+        load_docker_image_to_guest(ssh_base, image, selected_image_id)
 
-    # Importing a large image can leave the guest CPU and filesystem busy long
-    # enough for sshd to miss the short per-attempt SSH banner timeout. Probe
-    # until SSH is responsive again instead of making workspace staging the
-    # first (and only) post-load connection attempt.
-    emit_status("run", "Waiting for guest SSH after image load")
-    wait_for_ssh(ssh_base, 120)
+        # Importing a large image can leave the guest CPU and filesystem busy
+        # long enough for sshd to miss the short per-attempt SSH banner timeout.
+        emit_status("run", "Waiting for guest SSH after image load")
+        wait_for_ssh(ssh_base, 120)
 
     emit_status("workspace", "Staging workspace into guest")
     log(f"staging workspace into guest {guest_workspace}")
@@ -445,6 +486,57 @@ def grow_rootfs(rootfs):
     run(["resize2fs", str(rootfs)])
 
 
+def allow_full_copy_fallback():
+    return os.environ.get("PROJ_CREATOR_FIRECRACKER_ALLOW_FULL_COPY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def clone_rootfs(source, destination):
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = run(
+        ["cp", "--reflink=always", str(source), str(destination)],
+        check=False,
+    )
+    if result.returncode == 0:
+        return "reflink"
+    if not allow_full_copy_fallback():
+        fail(
+            "Firecracker prepared image snapshots require copy-on-write reflink support "
+            f"from {source} to {destination}"
+        )
+    shutil.copyfile(source, destination)
+    return "copy"
+
+
+def prepared_image_cache_ready(warm_dir, selected_image_id):
+    warm_dir = Path(warm_dir)
+    rootfs = warm_dir / "rootfs.ext4"
+    marker = warm_dir / "prepared.json"
+    if not rootfs.is_file() or not marker.is_file():
+        return False
+    try:
+        metadata = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return metadata.get("selected_image_id") == selected_image_id
+
+
+def replace_run_rootfs_from_cache(rootfs, warm_dir):
+    rootfs = Path(rootfs)
+    cached_rootfs = Path(warm_dir) / "rootfs.ext4"
+    temporary = rootfs.with_name(f"{rootfs.name}.cache-{os.getpid()}")
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+    clone_mode = clone_rootfs(cached_rootfs, temporary)
+    os.replace(temporary, rootfs)
+    return clone_mode
+
+
 def rootfs_user_ids(mount_dir, user):
     passwd_path = mount_dir / "etc" / "passwd"
     try:
@@ -474,6 +566,31 @@ def inject_ssh_key(rootfs, mount_dir, public_key):
             run_privileged(["chmod", "0600", str(authorized_keys)])
             run_privileged(["chown", "-R", f"{uid}:{gid}", str(ssh_dir)])
             log(f"injected SSH key for {user}")
+    finally:
+        run_privileged(["umount", str(mount_dir)], check=False)
+
+
+def sanitize_prepared_rootfs(rootfs, mount_dir, public_key):
+    run_privileged(["mount", "-o", "loop", str(rootfs), str(mount_dir)])
+    try:
+        for home in ["root", "home/appuser"]:
+            authorized_keys = mount_dir / home / ".ssh" / "authorized_keys"
+            script = (
+                f"file={shlex.quote(str(authorized_keys))}; "
+                f"key={shlex.quote(public_key)}; "
+                "if [ -f \"$file\" ]; then "
+                "tmp=${file}.proj-creator-tmp; "
+                "grep -Fvx -- \"$key\" \"$file\" > \"$tmp\" || true; "
+                "cat \"$tmp\" > \"$file\"; rm -f \"$tmp\"; fi"
+            )
+            run_privileged(["sh", "-c", script])
+        ssh_dir = mount_dir / "etc" / "ssh"
+        script = (
+            f"dir={shlex.quote(str(ssh_dir))}; "
+            "for file in \"$dir\"/ssh_host_*; do "
+            "[ ! -e \"$file\" ] || rm -f -- \"$file\"; done"
+        )
+        run_privileged(["sh", "-c", script])
     finally:
         run_privileged(["umount", str(mount_dir)], check=False)
 
@@ -697,6 +814,177 @@ def stop_loopback_proxies(proxies):
             pass
 
 
+def guest_shutdown_script():
+    return (
+        "python3 -c 'import ctypes, os; os.sync(); "
+        "ctypes.CDLL(None).reboot(0x4321fedc)' "
+        "|| poweroff || shutdown -h now || halt -f || true"
+    )
+
+
+def prepare_agent_image_snapshot(
+    firecracker,
+    kernel,
+    rootfs,
+    warm_dir,
+    run_dir,
+    selected_image,
+    selected_image_id,
+):
+    warm_dir = Path(warm_dir)
+    prep_dir = Path(run_dir) / "image-cache-prep"
+    prep_dir.mkdir(parents=True, exist_ok=True)
+    mount_dir = prep_dir / "rootfs-mount"
+    mount_dir.mkdir(parents=True, exist_ok=True)
+    key_path = prep_dir / "guest_ssh_key"
+    socket_id = hashlib.sha256(str(prep_dir).encode("utf-8")).hexdigest()[:16]
+    api_socket = Path(os.environ.get("TMPDIR", "/tmp")) / f"pcfc-{socket_id}.sock"
+    log_path = prep_dir / "firecracker.log"
+    metrics_path = prep_dir / "firecracker-metrics.json"
+    for path in [api_socket, key_path, key_path.with_suffix(".pub"), metrics_path]:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)])
+    public_key = key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
+    inject_ssh_key(rootfs, mount_dir, public_key)
+
+    tap, host_ip, guest_ip, mac = stable_network(prep_dir)
+    firecracker_process = None
+    fc_log = None
+    nat_cleanup = []
+    prepared = False
+    try:
+        emit_status("setup", "Booting one-time agent image preparation VM")
+        run_privileged(["ip", "link", "del", tap], check=False)
+        run_privileged(
+            ["ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", str(os.getuid())]
+        )
+        run_privileged(["ip", "addr", "add", f"{host_ip}/24", "dev", tap])
+        run_privileged(["ip", "link", "set", tap, "up"])
+        nat_cleanup = setup_guest_nat(tap, host_ip)
+
+        fc_log = log_path.open("ab")
+        firecracker_process = subprocess.Popen(
+            [firecracker, "--api-sock", str(api_socket)],
+            stdout=fc_log,
+            stderr=fc_log,
+        )
+        wait_for_path(api_socket, 10, "Firecracker image preparation API socket")
+        boot_args = (
+            "console=ttyS0 reboot=k panic=1 pci=off "
+            "root=/dev/vda rw init=/sbin/proj-creator-init "
+            f"ip={guest_ip}::{host_ip}:255.255.255.0::eth0:off"
+        )
+        firecracker_request(api_socket, "PUT", "/logger", {
+            "log_path": str(log_path),
+            "level": "Info",
+            "show_level": True,
+            "show_log_origin": True,
+        })
+        firecracker_request(api_socket, "PUT", "/metrics", {"metrics_path": str(metrics_path)})
+        firecracker_request(api_socket, "PUT", "/machine-config", {
+            "vcpu_count": int(os.environ.get("PROJ_CREATOR_FIRECRACKER_VCPUS", "2")),
+            "mem_size_mib": int(os.environ.get("PROJ_CREATOR_FIRECRACKER_MEM_MIB", "8192")),
+            "smt": False,
+        })
+        firecracker_request(api_socket, "PUT", "/boot-source", {
+            "kernel_image_path": str(kernel),
+            "boot_args": boot_args,
+        })
+        firecracker_request(api_socket, "PUT", "/drives/rootfs", {
+            "drive_id": "rootfs",
+            "path_on_host": str(rootfs),
+            "is_root_device": True,
+            "is_read_only": False,
+        })
+        firecracker_request(api_socket, "PUT", "/network-interfaces/eth0", {
+            "iface_id": "eth0",
+            "guest_mac": mac,
+            "host_dev_name": tap,
+        })
+        firecracker_request(api_socket, "PUT", "/actions", {"action_type": "InstanceStart"})
+
+        common_ssh = [
+            "ssh",
+            "-i", str(key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=3",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=2",
+        ]
+        ssh_base = [*common_ssh, f"appuser@{guest_ip}"]
+        root_ssh_base = [*common_ssh, f"root@{guest_ip}"]
+        wait_for_ssh(ssh_base, 120)
+        configure_guest_dns(root_ssh_base, firecracker_dns_servers())
+        ssh_command(
+            ssh_base,
+            "for i in $(seq 1 120); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1",
+        )
+        emit_status("setup", "Importing agent image into reusable snapshot")
+        load_docker_image_to_guest(ssh_base, selected_image, selected_image_id)
+        wait_for_ssh(ssh_base, 120)
+        prepared_id = guest_docker_image_id(ssh_base, selected_image)
+        if prepared_id != selected_image_id:
+            fail(
+                "prepared guest Docker image ID did not match host image: "
+                f"expected {selected_image_id}, got {prepared_id or 'missing'}"
+            )
+        run(
+            ["timeout", "15", *root_ssh_base, "bash", "-lc", shlex.quote(guest_shutdown_script())],
+            check=False,
+        )
+        try:
+            firecracker_process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            fail("image preparation VM did not shut down cleanly")
+        prepared = True
+    finally:
+        if firecracker_process:
+            terminate_process(firecracker_process, "Firecracker image preparation VM")
+        if fc_log:
+            fc_log.close()
+        try:
+            api_socket.unlink()
+        except FileNotFoundError:
+            pass
+        run_privileged(["ip", "link", "del", tap], check=False)
+        cleanup_guest_nat(nat_cleanup)
+        sanitize_prepared_rootfs(rootfs, mount_dir, public_key)
+
+    if not prepared:
+        fail("agent image snapshot preparation did not complete")
+
+    warm_dir.mkdir(parents=True, exist_ok=True)
+    marker = warm_dir / "prepared.json"
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+    temporary_rootfs = warm_dir / f"rootfs.ext4.tmp-{os.getpid()}"
+    temporary_marker = warm_dir / f"prepared.json.tmp-{os.getpid()}"
+    for path in [temporary_rootfs, temporary_marker]:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    clone_mode = clone_rootfs(rootfs, temporary_rootfs)
+    metadata = {
+        "format_version": 1,
+        "selected_image": selected_image,
+        "selected_image_id": selected_image_id,
+        "clone_mode": clone_mode,
+        "prepared_at_unix": int(time.time()),
+    }
+    temporary_marker.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary_rootfs, warm_dir / "rootfs.ext4")
+    os.replace(temporary_marker, marker)
+    emit_status("setup", "Published reusable agent image snapshot")
+
+
 def run_request(request):
     contract_version = int(request.get("contract_version", 1))
     if contract_version != 1:
@@ -704,9 +992,11 @@ def run_request(request):
     rootfs = Path(request["rootfs"]).resolve()
     kernel = Path(request["kernel_image"]).resolve()
     run_dir = Path(request["run_dir"]).resolve()
+    warm_dir = Path(request["warm_dir"]).resolve()
     repo = Path(request["repo"]).resolve()
     workdir = request.get("workdir") or "/workspace"
     selected_image = request["selected_image"]
+    selected_image_id = str(request.get("selected_image_id") or "").strip()
     inner_script = request["inner_script"]
     envs = request.get("envs") or []
     workspace_uid = int(request.get("workspace_uid") or 10001)
@@ -720,10 +1010,13 @@ def run_request(request):
         fail(f"repo directory does not exist: {repo}")
 
     firecracker = require_command("firecracker")
-    for command in ["docker", "e2fsck", "ip", "resize2fs", "ssh", "ssh-keygen", "tar", "truncate", "mount", "umount"]:
+    for command in ["cp", "docker", "e2fsck", "ip", "resize2fs", "ssh", "ssh-keygen", "tar", "truncate", "mount", "umount"]:
         require_command(command)
+    if not selected_image_id:
+        selected_image_id = host_docker_image_id(selected_image)
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    warm_dir.mkdir(parents=True, exist_ok=True)
     emit_status("setup", "Preparing Firecracker run directory")
     socket_id = hashlib.sha256(str(run_dir).encode("utf-8")).hexdigest()[:16]
     api_socket = Path(os.environ.get("TMPDIR", "/tmp")) / f"pcfc-{socket_id}.sock"
@@ -740,6 +1033,25 @@ def run_request(request):
 
     emit_status("setup", "Preparing Firecracker rootfs")
     grow_rootfs(rootfs)
+    cache_lock_path = warm_dir / "prepare.lock"
+    with cache_lock_path.open("a+b") as cache_lock:
+        fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
+        if prepared_image_cache_ready(warm_dir, selected_image_id):
+            emit_status("setup", "Cloning prepared agent image snapshot")
+            replace_run_rootfs_from_cache(rootfs, warm_dir)
+        else:
+            emit_status("setup", "Preparing reusable agent image snapshot on first use")
+            prepare_agent_image_snapshot(
+                firecracker,
+                kernel,
+                rootfs,
+                warm_dir,
+                run_dir,
+                selected_image,
+                selected_image_id,
+            )
+            replace_run_rootfs_from_cache(rootfs, warm_dir)
+        fcntl.flock(cache_lock.fileno(), fcntl.LOCK_UN)
     run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)])
     public_key = key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
     emit_status("setup", "Injecting guest SSH key")
@@ -859,6 +1171,8 @@ def run_request(request):
             guest_workspace,
             workspace_uid,
             workspace_gid,
+            selected_image_id,
+            warm_dir,
         )
 
         guest_mounts = []
@@ -940,12 +1254,10 @@ def run_request(request):
         log("syncing workspace changes back from guest")
         tar_from_guest(root_ssh_base, guest_workspace, repo)
         chown_host_path(repo, workspace_uid, workspace_gid)
-        shutdown_script = (
-            "python3 -c 'import ctypes, os; os.sync(); "
-            "ctypes.CDLL(None).reboot(0x4321fedc)' "
-            "|| poweroff || shutdown -h now || halt -f || true"
+        run(
+            ["timeout", "8", *root_ssh_base, "bash", "-lc", shlex.quote(guest_shutdown_script())],
+            check=False,
         )
-        run(["timeout", "8", *root_ssh_base, "bash", "-lc", shlex.quote(shutdown_script)], check=False)
     except RunnerInterrupted as interrupted:
         exit_code = 128 + interrupted.signum
         log(f"received signal {interrupted.signum}; cleaning up Firecracker resources")

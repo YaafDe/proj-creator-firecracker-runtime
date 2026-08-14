@@ -163,12 +163,21 @@ Firecracker through its Unix API socket, stages the workspace into the guest,
 runs the selected agent Docker image inside the VM, syncs workspace changes
 back, and exits with the agent status.
 
+The published rootfs always remains application-independent. On the first use
+of an immutable agent Docker image, the runner serializes preparation with a
+per-image lock, boots a temporary VM from a COW clone of the generic rootfs,
+imports the image, shuts down cleanly, removes the temporary SSH key, and
+atomically publishes a prepared rootfs plus marker. Normal runs reflink-clone
+that project/image/template-scoped rootfs and verify the expected Docker image
+ID inside the guest before skipping transfer. A missing or invalid snapshot
+falls back to `docker save` / `docker load` and invalidates the marker.
+
 The runner expects the host to provide `docker`, `firecracker`, `ip`, `ssh`,
 `ssh-keygen`, `tar`, `mount`, `umount`, and either root privileges or
-passwordless `sudo` for the tap and loop-mount steps. It loads the selected
-agent image from the host Docker daemon into the guest with `docker save` /
-`docker load`, so the guest does not need registry access just to start the
-agent image.
+passwordless `sudo` for the tap and loop-mount steps. The one-time preparation
+path loads the selected agent image from the host Docker daemon with `docker
+save` / `docker load`, so the guest does not need registry access just to start
+the agent image.
 
 ## Security Rules
 

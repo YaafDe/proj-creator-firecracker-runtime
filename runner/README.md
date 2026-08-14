@@ -14,9 +14,12 @@ runtime dependencies. It expects the host to provide `docker`, `firecracker`,
 or passwordless `sudo` for loop mounting the per-run rootfs and creating the tap
 device.
 
-The runner stages the host workspace into the guest over SSH, runs the selected
-agent Docker image inside the VM after loading it from the host Docker daemon,
-then syncs the workspace back while excluding `.git` so host Git metadata is not
+The release rootfs is generic. The runner prepares a project/image-scoped COW
+rootfs once by importing the immutable selected image in an isolated temporary
+VM, then boots per-run reflink clones from that cache. It verifies the image ID
+inside every guest and retains `docker save` / `docker load` as a compatible
+fallback. The runner stages the host workspace only after image preparation,
+then syncs it back while excluding `.git` so host Git metadata is not
 overwritten by the guest copy.
 
 The runner accepts Firecracker runner contract version `1`. Requests that omit

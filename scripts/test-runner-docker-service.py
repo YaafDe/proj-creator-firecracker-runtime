@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import pathlib
 import signal
+import tempfile
 import unittest
 from unittest import mock
 
@@ -72,6 +73,10 @@ class GuestImageStagingTests(unittest.TestCase):
 
         with mock.patch.object(module, "emit_status"), mock.patch.object(
             module,
+            "guest_docker_image_id",
+            return_value=None,
+        ), mock.patch.object(
+            module,
             "load_docker_image_to_guest",
             operations.load_image,
         ), mock.patch.object(
@@ -95,12 +100,17 @@ class GuestImageStagingTests(unittest.TestCase):
                 "/workspace",
                 10001,
                 10001,
+                "sha256:expected",
             )
 
         self.assertEqual(
             operations.mock_calls,
             [
-                mock.call.load_image(ssh_base, "proj-creator-agent:test"),
+                mock.call.load_image(
+                    ssh_base,
+                    "proj-creator-agent:test",
+                    "sha256:expected",
+                ),
                 mock.call.wait_for_ssh(ssh_base, 120),
                 mock.call.tar_to_guest(ssh_base, repo, "/workspace"),
                 mock.call.chown_guest_workspace(
@@ -111,6 +121,75 @@ class GuestImageStagingTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_prepared_image_skips_host_transfer(self):
+        operations = mock.Mock()
+        ssh_base = ["ssh", "appuser@guest"]
+        root_ssh_base = ["ssh", "root@guest"]
+        repo = pathlib.Path("/tmp/repo")
+
+        with mock.patch.object(module, "emit_status"), mock.patch.object(
+            module,
+            "guest_docker_image_id",
+            return_value="sha256:prepared",
+        ), mock.patch.object(
+            module,
+            "load_docker_image_to_guest",
+            operations.load_image,
+        ), mock.patch.object(
+            module,
+            "wait_for_ssh",
+            operations.wait_for_ssh,
+        ), mock.patch.object(
+            module,
+            "tar_to_guest",
+            operations.tar_to_guest,
+        ), mock.patch.object(
+            module,
+            "chown_guest_workspace",
+            operations.chown_guest_workspace,
+        ):
+            module.load_image_and_stage_workspace(
+                ssh_base,
+                root_ssh_base,
+                "proj-creator-agent:test",
+                repo,
+                "/workspace",
+                10001,
+                10001,
+                "sha256:prepared",
+            )
+
+        self.assertEqual(
+            operations.mock_calls,
+            [
+                mock.call.tar_to_guest(ssh_base, repo, "/workspace"),
+                mock.call.chown_guest_workspace(
+                    root_ssh_base,
+                    "/workspace",
+                    10001,
+                    10001,
+                ),
+            ],
+        )
+
+
+class PreparedImageCacheTests(unittest.TestCase):
+    def test_cache_requires_matching_immutable_image_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            warm_dir = pathlib.Path(directory)
+            (warm_dir / "rootfs.ext4").write_bytes(b"prepared")
+            (warm_dir / "prepared.json").write_text(
+                '{"selected_image_id":"sha256:image-a"}',
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                module.prepared_image_cache_ready(warm_dir, "sha256:image-a")
+            )
+            self.assertFalse(
+                module.prepared_image_cache_ready(warm_dir, "sha256:image-b")
+            )
 
 
 class SshCommandTransportTests(unittest.TestCase):
