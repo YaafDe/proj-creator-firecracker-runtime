@@ -83,9 +83,17 @@ def format_command(command):
     return redact_sensitive_text(shlex.join(parts))
 
 
-def run(command, *, stdin=None, stdout=None, check=True):
+def run(command, *, stdin=None, stdout=None, input_data=None, check=True):
+    if stdin is not None and input_data is not None:
+        raise ValueError("stdin and input_data are mutually exclusive")
     log("+ " + format_command(command))
-    result = subprocess.run(command, stdin=stdin, stdout=stdout, check=False)
+    result = subprocess.run(
+        command,
+        stdin=stdin,
+        stdout=stdout,
+        input=input_data,
+        check=False,
+    )
     if check and result.returncode != 0:
         fail(f"command failed with exit code {result.returncode}: {format_command(command)}")
     return result
@@ -159,16 +167,32 @@ def wait_for_ssh(ssh_base, seconds):
 
 
 def ssh_command(ssh_base, script, *, check=True, stdout=None, stdin=None):
-    return run([*ssh_base, "bash", "-lc", shlex.quote(script)], check=check, stdout=stdout, stdin=stdin)
+    if stdin is not None:
+        return run(
+            [*ssh_base, "bash", "-lc", shlex.quote(script)],
+            check=check,
+            stdout=stdout,
+            stdin=stdin,
+        )
+    return run(
+        [*ssh_base, "bash", "-l", "-s"],
+        check=check,
+        stdout=stdout,
+        input_data=script.encode("utf-8"),
+    )
 
 
 def ssh_output(ssh_base, script):
-    command = [*ssh_base, "bash", "-lc", shlex.quote(script)]
-    log("+ " + format_command(command))
-    result = subprocess.run(command, check=False, stdout=subprocess.PIPE, text=True)
+    command = [*ssh_base, "bash", "-l", "-s"]
+    result = run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        input_data=script.encode("utf-8"),
+    )
     if result.returncode != 0:
         fail(f"command failed with exit code {result.returncode}: {format_command(command)}")
-    return result.stdout
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 def docker_service_args(required, socket_gid):

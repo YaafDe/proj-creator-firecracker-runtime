@@ -113,6 +113,54 @@ class GuestImageStagingTests(unittest.TestCase):
         )
 
 
+class SshCommandTransportTests(unittest.TestCase):
+    def test_large_remote_script_is_streamed_instead_of_added_to_argv(self):
+        script = "printf x\n" * 20000
+        ssh_base = ["ssh", "appuser@guest"]
+
+        with mock.patch.object(module, "run") as run:
+            module.ssh_command(ssh_base, script, check=False)
+
+        run.assert_called_once_with(
+            [*ssh_base, "bash", "-l", "-s"],
+            check=False,
+            stdout=None,
+            input_data=script.encode("utf-8"),
+        )
+        self.assertNotIn(script, run.call_args.args[0])
+
+    def test_payload_stdin_keeps_the_remote_script_as_a_small_argument(self):
+        script = "tar -C /workspace -xf -"
+        payload = object()
+        ssh_base = ["ssh", "root@guest"]
+
+        with mock.patch.object(module, "run") as run:
+            module.ssh_command(ssh_base, script, stdin=payload)
+
+        run.assert_called_once_with(
+            [*ssh_base, "bash", "-lc", module.shlex.quote(script)],
+            check=True,
+            stdout=None,
+            stdin=payload,
+        )
+
+    def test_ssh_output_streams_script_and_decodes_stdout(self):
+        script = "id -u"
+        ssh_base = ["ssh", "appuser@guest"]
+        result = mock.Mock(returncode=0, stdout=b"10001\n")
+
+        with mock.patch.object(module, "run", return_value=result) as run:
+            output = module.ssh_output(ssh_base, script)
+
+        self.assertEqual(output, "10001\n")
+        run.assert_called_once_with(
+            [*ssh_base, "bash", "-l", "-s"],
+            check=False,
+            stdout=module.subprocess.PIPE,
+            input_data=script.encode("utf-8"),
+        )
+
+
 class NetworkCleanupTests(unittest.TestCase):
     def test_preexisting_per_run_rule_is_still_owned_for_cleanup(self):
         with mock.patch.object(module, "iptables_rule_exists", return_value=True), mock.patch.object(
