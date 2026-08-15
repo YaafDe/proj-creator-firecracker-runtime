@@ -283,6 +283,23 @@ class DockerLoadOutputTests(unittest.TestCase):
         )
 
 
+class PreparedImageShutdownTests(unittest.TestCase):
+    def test_large_guest_image_flush_has_a_separate_bounded_phase(self):
+        root_ssh_base = ["ssh", "root@guest"]
+
+        with mock.patch.object(module, "emit_status") as emit_status, mock.patch.object(
+            module,
+            "run",
+        ) as run:
+            module.flush_prepared_guest_filesystem(root_ssh_base)
+
+        emit_status.assert_called_once_with(
+            "setup",
+            "Flushing prepared agent image filesystem",
+        )
+        run.assert_called_once_with(["timeout", "180", *root_ssh_base, "sync"])
+
+
 class SshCommandTransportTests(unittest.TestCase):
     def test_large_remote_script_is_streamed_instead_of_added_to_argv(self):
         script = "printf x\n" * 20000

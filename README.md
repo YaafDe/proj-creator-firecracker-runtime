@@ -180,7 +180,10 @@ that project/image/template-scoped rootfs and verify the recorded guest Docker
 image ID before skipping transfer. The immutable host image ID remains the
 cache key, while the marker separately records the ID reported by the guest's
 `docker load`; different Docker versions may legitimately assign different
-config IDs during this transfer. A missing or invalid snapshot falls back to
+config IDs during this transfer. Before clean shutdown and publication, the
+one-time preparation VM performs a separately bounded filesystem flush; this
+allows large imported layers to settle without coupling durability to the
+short reboot-command timeout. A missing or invalid snapshot falls back to
 `docker save` / `docker load` and invalidates the marker.
 
 The runner expects the host to provide `docker`, `firecracker`, `ip`, `ssh`,

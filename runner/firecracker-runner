@@ -878,6 +878,14 @@ def guest_shutdown_script():
     )
 
 
+def flush_prepared_guest_filesystem(root_ssh_base):
+    # docker load may return before the guest kernel has flushed several GiB of
+    # layer data. Give that one-time flush its own bounded phase so the short
+    # reboot transport timeout cannot kill the sync process halfway through.
+    emit_status("setup", "Flushing prepared agent image filesystem")
+    run(["timeout", "180", *root_ssh_base, "sync"])
+
+
 def prepare_agent_image_snapshot(
     firecracker,
     kernel,
@@ -984,12 +992,13 @@ def prepare_agent_image_snapshot(
         load_result = load_docker_image_to_guest(ssh_base, selected_image, selected_image_id)
         wait_for_ssh(ssh_base, 120)
         prepared_id = resolve_loaded_guest_image(ssh_base, selected_image, load_result)
+        flush_prepared_guest_filesystem(root_ssh_base)
         run(
             ["timeout", "15", *root_ssh_base, "bash", "-lc", shlex.quote(guest_shutdown_script())],
             check=False,
         )
         try:
-            firecracker_process.wait(timeout=20)
+            firecracker_process.wait(timeout=30)
         except subprocess.TimeoutExpired:
             fail("image preparation VM did not shut down cleanly")
         prepared = True
