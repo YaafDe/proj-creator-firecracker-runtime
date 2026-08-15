@@ -85,6 +85,10 @@ class GuestImageStagingTests(unittest.TestCase):
             operations.wait_for_ssh,
         ), mock.patch.object(
             module,
+            "ensure_guest_image_reference",
+            operations.ensure_image_reference,
+        ), mock.patch.object(
+            module,
             "tar_to_guest",
             operations.tar_to_guest,
         ), mock.patch.object(
@@ -113,6 +117,9 @@ class GuestImageStagingTests(unittest.TestCase):
                     "sha256:expected",
                 ),
                 mock.call.wait_for_ssh(ssh_base, 120),
+                mock.call.ensure_image_reference(
+                    ssh_base, "sha256:guest", "proj-creator-agent:test"
+                ),
                 mock.call.tar_to_guest(ssh_base, repo, "/workspace"),
                 mock.call.chown_guest_workspace(
                     root_ssh_base,
@@ -145,6 +152,10 @@ class GuestImageStagingTests(unittest.TestCase):
             operations.wait_for_ssh,
         ), mock.patch.object(
             module,
+            "ensure_guest_image_reference",
+            operations.ensure_image_reference,
+        ), mock.patch.object(
+            module,
             "tar_to_guest",
             operations.tar_to_guest,
         ), mock.patch.object(
@@ -174,6 +185,9 @@ class GuestImageStagingTests(unittest.TestCase):
             operations.mock_calls,
             [
                 mock.call.wait_for_ssh(ssh_base, 120),
+                mock.call.ensure_image_reference(
+                    ssh_base, guest_id, "proj-creator-agent:test"
+                ),
                 mock.call.tar_to_guest(ssh_base, repo, "/workspace"),
                 mock.call.chown_guest_workspace(
                     root_ssh_base,
@@ -204,6 +218,10 @@ class GuestImageStagingTests(unittest.TestCase):
             operations.wait_for_ssh,
         ), mock.patch.object(
             module,
+            "ensure_guest_image_reference",
+            operations.ensure_image_reference,
+        ), mock.patch.object(
+            module,
             "tar_to_guest",
             operations.tar_to_guest,
         ), mock.patch.object(
@@ -225,6 +243,9 @@ class GuestImageStagingTests(unittest.TestCase):
         self.assertEqual(
             operations.mock_calls,
             [
+                mock.call.ensure_image_reference(
+                    ssh_base, "sha256:prepared", "proj-creator-agent:test"
+                ),
                 mock.call.tar_to_guest(ssh_base, repo, "/workspace"),
                 mock.call.chown_guest_workspace(
                     root_ssh_base,
@@ -281,6 +302,31 @@ class DockerLoadOutputTests(unittest.TestCase):
             module.parse_docker_load_output("Loaded image: proj-creator-agent:test\n"),
             (None, ["proj-creator-agent:test"]),
         )
+
+    def test_preserves_requested_guest_image_tag(self):
+        guest_id = "sha256:" + "b" * 64
+        with mock.patch.object(module, "ssh_command") as ssh_command:
+            module.ensure_guest_image_reference(
+                ["ssh", "appuser@guest"],
+                guest_id,
+                "proj-creator-agent:test",
+            )
+
+        ssh_command.assert_called_once_with(
+            ["ssh", "appuser@guest"],
+            f"docker image tag {guest_id} proj-creator-agent:test",
+        )
+
+    def test_does_not_treat_an_immutable_id_as_a_tag(self):
+        guest_id = "sha256:" + "b" * 64
+        with mock.patch.object(module, "ssh_command") as ssh_command:
+            module.ensure_guest_image_reference(
+                ["ssh", "appuser@guest"],
+                guest_id,
+                "sha256:" + "a" * 64,
+            )
+
+        ssh_command.assert_not_called()
 
 
 class PreparedImageShutdownTests(unittest.TestCase):

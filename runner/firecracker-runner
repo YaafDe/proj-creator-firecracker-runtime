@@ -458,6 +458,21 @@ def guest_docker_image_id(ssh_base, image):
     return result.stdout.decode("utf-8", errors="replace").strip() or None
 
 
+def ensure_guest_image_reference(ssh_base, guest_image_id, selected_image):
+    # Docker may rewrite an image's immutable ID while importing it across
+    # daemon versions. Keep the requested tag as well as the resolved guest ID:
+    # agent containers run by ID, while nested Docker workflows may discover or
+    # reuse the image by its stable tag.
+    if selected_image == guest_image_id or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", selected_image
+    ):
+        return
+    ssh_command(
+        ssh_base,
+        f"docker image tag {shlex.quote(guest_image_id)} {shlex.quote(selected_image)}",
+    )
+
+
 def load_image_and_stage_workspace(
     ssh_base,
     root_ssh_base,
@@ -497,6 +512,7 @@ def load_image_and_stage_workspace(
         wait_for_ssh(ssh_base, 120)
         guest_image_id = resolve_loaded_guest_image(ssh_base, image, load_result)
 
+    ensure_guest_image_reference(ssh_base, guest_image_id, image)
     emit_status("workspace", "Staging workspace into guest")
     log(f"staging workspace into guest {guest_workspace}")
     tar_to_guest(ssh_base, repo, guest_workspace)
