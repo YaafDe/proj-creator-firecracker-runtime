@@ -872,9 +872,11 @@ def stop_loopback_proxies(proxies):
 
 def guest_shutdown_script():
     return (
-        "python3 -c 'import ctypes, os; os.sync(); "
-        "ctypes.CDLL(None).reboot(0x4321fedc)' "
-        "|| poweroff || shutdown -h now || halt -f || true"
+        "python3 -c 'import ctypes, os, sys; os.sync(); "
+        "libc = ctypes.CDLL(None, use_errno=True); "
+        "result = libc.reboot(0x01234567); "
+        "sys.exit(0 if result == 0 else ctypes.get_errno() or 1)' "
+        "|| reboot -f || shutdown -r now || true"
     )
 
 

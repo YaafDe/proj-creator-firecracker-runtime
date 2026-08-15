@@ -284,6 +284,15 @@ class DockerLoadOutputTests(unittest.TestCase):
 
 
 class PreparedImageShutdownTests(unittest.TestCase):
+    def test_guest_shutdown_requests_restart_instead_of_unsupported_poweroff(self):
+        script = module.guest_shutdown_script()
+
+        self.assertIn("0x01234567", script)
+        self.assertIn("use_errno=True", script)
+        self.assertIn("reboot -f", script)
+        self.assertNotIn("0x4321fedc", script)
+        self.assertNotIn("poweroff", script)
+
     def test_large_guest_image_flush_has_a_separate_bounded_phase(self):
         root_ssh_base = ["ssh", "root@guest"]
 
