@@ -290,6 +290,36 @@ class PreparedImageCacheTests(unittest.TestCase):
 
 
 class DockerLoadOutputTests(unittest.TestCase):
+    def test_bulk_image_transfer_uses_operation_timeout_not_short_ssh_keepalives(self):
+        ssh_base = [
+            "ssh",
+            "-i",
+            "/tmp/guest-key",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ServerAliveInterval=15",
+            "-oServerAliveCountMax=2",
+            "appuser@guest",
+        ]
+
+        transfer_base = module.ssh_base_for_bounded_bulk_transfer(ssh_base)
+
+        self.assertEqual(
+            transfer_base,
+            [
+                "ssh",
+                "-i",
+                "/tmp/guest-key",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "ServerAliveInterval=0",
+                "appuser@guest",
+            ],
+        )
+        self.assertEqual(ssh_base[-1], "appuser@guest")
+
     def test_parses_guest_id_rewritten_during_cross_version_load(self):
         guest_id = "sha256:" + "b" * 64
         self.assertEqual(

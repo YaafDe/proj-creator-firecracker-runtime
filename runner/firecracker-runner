@@ -168,6 +168,47 @@ def wait_for_ssh(ssh_base, seconds):
     fail("timed out waiting for guest SSH")
 
 
+def ssh_base_for_bounded_bulk_transfer(ssh_base):
+    """Keep long transfers under the caller's deadline, not SSH keepalives.
+
+    The regular guest SSH transport deliberately gives up quickly when a VM
+    becomes unresponsive.  That is too aggressive while ``docker load`` is
+    unpacking a large agent image: sustained guest filesystem pressure can
+    delay keepalive replies for longer than ServerAliveInterval multiplied by
+    ServerAliveCountMax even though the transfer is still making progress.
+
+    Bulk transfers already have their own explicit wall-clock timeout.  Remove
+    the short liveness options for that one connection and disable SSH's
+    server-alive cutoff so the bounded operation timeout remains authoritative.
+    """
+    if len(ssh_base) < 2:
+        fail("invalid SSH command for bulk transfer")
+
+    filtered = [ssh_base[0]]
+    arguments = ssh_base[1:-1]
+    index = 0
+    while index < len(arguments):
+        argument = str(arguments[index])
+        if argument == "-o" and index + 1 < len(arguments):
+            option = str(arguments[index + 1])
+            option_name = re.split(r"[=\\s]", option.strip(), maxsplit=1)[0].lower()
+            if option_name in {"serveraliveinterval", "serveralivecountmax"}:
+                index += 2
+                continue
+        if argument.startswith("-o") and len(argument) > 2:
+            option_name = re.split(
+                r"[=\\s]", argument[2:].strip(), maxsplit=1
+            )[0].lower()
+            if option_name in {"serveraliveinterval", "serveralivecountmax"}:
+                index += 1
+                continue
+        filtered.append(argument)
+        index += 1
+
+    filtered.extend(["-o", "ServerAliveInterval=0", str(ssh_base[-1])])
+    return filtered
+
+
 def ssh_command(ssh_base, script, *, check=True, stdout=None, stdin=None):
     if stdin is not None:
         return run(
@@ -389,11 +430,12 @@ def load_docker_image_to_guest(ssh_base, image, image_id=None):
     run(["docker", "image", "inspect", source_image], stdout=subprocess.DEVNULL)
     timeout_seconds = int(os.environ.get("PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS", "900"))
     save = subprocess.Popen(["docker", "save", source_image], stdout=subprocess.PIPE)
+    transfer_ssh_base = ssh_base_for_bounded_bulk_transfer(ssh_base)
     ssh = None
     with tempfile.TemporaryFile() as guest_stdout:
         try:
             ssh = subprocess.Popen(
-                [*ssh_base, "bash", "-lc", shlex.quote("docker load")],
+                [*transfer_ssh_base, "bash", "-lc", shlex.quote("docker load")],
                 stdin=save.stdout,
                 stdout=guest_stdout,
             )
@@ -1031,7 +1073,11 @@ def prepare_agent_image_snapshot(
             pass
         run_privileged(["ip", "link", "del", tap], check=False)
         cleanup_guest_nat(nat_cleanup)
-        sanitize_prepared_rootfs(rootfs, mount_dir, public_key)
+        # A failed preparation rootfs is transient and is never published.
+        # Do not replace the original failure with a follow-up mount error when
+        # the VM had to be terminated during heavy filesystem activity.
+        if prepared:
+            sanitize_prepared_rootfs(rootfs, mount_dir, public_key)
 
     if not prepared:
         fail("agent image snapshot preparation did not complete")
