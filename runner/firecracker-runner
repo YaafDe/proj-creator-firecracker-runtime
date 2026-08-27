@@ -294,6 +294,77 @@ def terminate_process(process, name):
         process.wait(timeout=5)
 
 
+def read_tail(file_obj, max_bytes=8192):
+    file_obj.flush()
+    file_obj.seek(0, os.SEEK_END)
+    size = file_obj.tell()
+    file_obj.seek(max(0, size - max_bytes))
+    return file_obj.read().decode("utf-8", errors="replace")
+
+
+def log_prefixed_block(prefix, value):
+    value = redact_sensitive_text(value).strip()
+    if not value:
+        return
+    for line in value.splitlines():
+        log(f"{prefix}: {line}")
+
+
+def root_ssh_base(ssh_base):
+    root_base = list(ssh_base)
+    if not root_base or "@" not in str(root_base[-1]):
+        return root_base
+    host = str(root_base[-1]).split("@", maxsplit=1)[1]
+    root_base[-1] = f"root@{host}"
+    return root_base
+
+
+def collect_guest_docker_load_diagnostics(ssh_base, image):
+    timeout_seconds = int(os.environ.get(
+        "PROJ_CREATOR_FIRECRACKER_DOCKER_DIAGNOSTIC_TIMEOUT_SECONDS",
+        "30",
+    ))
+    image_q = shlex.quote(image)
+    script = f"""
+set +e
+echo '== docker info =='
+docker info --format 'ServerVersion={{{{.ServerVersion}}}} Driver={{{{.Driver}}}} DockerRootDir={{{{.DockerRootDir}}}}' 2>&1
+echo '== docker image presence =='
+docker image inspect --format '{{{{.Id}}}} {{{{.Size}}}}' {image_q} 2>&1
+echo '== docker system df =='
+docker system df 2>&1
+echo '== filesystems =='
+df -h / /var/lib/docker /tmp 2>&1
+echo '== memory =='
+free -m 2>&1 || true
+echo '== load processes =='
+ps -eo pid,ppid,stat,etime,wchan:24,comm,args | grep -E 'dockerd|containerd|docker|sshd' | tail -n 80 2>&1 || true
+echo '== docker log tail =='
+tail -n 100 /var/log/proj-creator-dockerd.log 2>&1 || true
+echo '== containerd log tail =='
+tail -n 100 /var/log/proj-creator-containerd.log 2>&1 || true
+echo '== kernel tail =='
+dmesg | tail -n 100 2>&1 || true
+"""
+    command = [*root_ssh_base(ssh_base), "bash", "-lc", shlex.quote(script)]
+    log("+ " + format_command(command))
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"guest docker-load diagnostics timed out after {timeout_seconds}s")
+        return
+    output = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+    log_prefixed_block("guest docker-load diagnostic", output)
+    if result.returncode != 0:
+        log(f"guest docker-load diagnostics exited {result.returncode}")
+
+
 def tar_to_guest(ssh_base, source, destination):
     script = f"mkdir -p {shlex.quote(destination)} && tar -C {shlex.quote(destination)} -xf -"
     tar = subprocess.Popen(["tar", "-C", str(source), "-cf", "-", "."], stdout=subprocess.PIPE)
@@ -427,41 +498,90 @@ def resolve_loaded_guest_image(ssh_base, selected_image, load_result):
 
 def load_docker_image_to_guest(ssh_base, image, image_id=None):
     source_image = image_id or image
-    run(["docker", "image", "inspect", source_image], stdout=subprocess.DEVNULL)
-    timeout_seconds = int(os.environ.get("PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS", "900"))
-    save = subprocess.Popen(["docker", "save", source_image], stdout=subprocess.PIPE)
+    inspect = run(
+        ["docker", "image", "inspect", "--format", "{{.Size}}", source_image],
+        stdout=subprocess.PIPE,
+    )
+    image_size = inspect.stdout.decode("utf-8", errors="replace").strip()
+    if image_size.isdigit():
+        emit_status(
+            "setup",
+            f"Importing {int(image_size) / (1024 ** 3):.2f} GiB agent image into guest",
+        )
+
+    timeout_seconds = int(os.environ.get(
+        "PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS",
+        "1800",
+    ))
+    progress_seconds = max(1, int(os.environ.get(
+        "PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_PROGRESS_SECONDS",
+        "30",
+    )))
     transfer_ssh_base = ssh_base_for_bounded_bulk_transfer(ssh_base)
     ssh = None
-    with tempfile.TemporaryFile() as guest_stdout:
+    with tempfile.TemporaryFile() as guest_stdout, \
+            tempfile.TemporaryFile() as guest_stderr, \
+            tempfile.TemporaryFile() as save_stderr:
+        save = subprocess.Popen(
+            ["docker", "save", source_image],
+            stdout=subprocess.PIPE,
+            stderr=save_stderr,
+        )
         try:
             ssh = subprocess.Popen(
                 [*transfer_ssh_base, "bash", "-lc", shlex.quote("docker load")],
                 stdin=save.stdout,
                 stdout=guest_stdout,
+                stderr=guest_stderr,
             )
             if save.stdout:
                 save.stdout.close()
-            deadline = time.monotonic() + timeout_seconds
+            started = time.monotonic()
+            deadline = started + timeout_seconds
+            next_progress = started + progress_seconds
             while True:
                 save_status = save.poll()
                 ssh_status = ssh.poll()
                 if save_status is not None and ssh_status is not None:
                     break
-                if time.monotonic() > deadline:
+                now = time.monotonic()
+                if now >= next_progress:
+                    stage = (
+                        "Guest Docker is unpacking the agent image"
+                        if save_status is not None
+                        else "Streaming the agent image to guest Docker"
+                    )
+                    emit_status("setup", f"{stage} ({int(now - started)}s elapsed)")
+                    next_progress = now + progress_seconds
+                if now > deadline:
+                    state = (
+                        f"docker-save={save_status if save_status is not None else 'running'}, "
+                        f"guest-load={ssh_status if ssh_status is not None else 'running'}"
+                    )
                     terminate_process(save, "docker save")
                     terminate_process(ssh, "guest docker load")
-                    fail(f"timed out after {timeout_seconds}s loading Docker image into guest: {image}")
+                    log_prefixed_block("docker save stderr", read_tail(save_stderr))
+                    log_prefixed_block("guest docker load stderr", read_tail(guest_stderr))
+                    collect_guest_docker_load_diagnostics(ssh_base, image)
+                    fail(
+                        f"timed out after {timeout_seconds}s loading Docker image into guest "
+                        f"({state}): {image}"
+                    )
                 time.sleep(0.5)
         finally:
             if save.stdout:
                 save.stdout.close()
             if ssh is not None:
                 terminate_process(ssh, "guest docker load")
+            terminate_process(save, "docker save")
         status = save.wait()
         if status != 0:
+            log_prefixed_block("docker save stderr", read_tail(save_stderr))
             fail(f"docker save failed with exit code {status}: {image}")
         ssh_status = ssh.wait() if ssh is not None else 1
         if ssh_status != 0:
+            log_prefixed_block("guest docker load stderr", read_tail(guest_stderr))
+            collect_guest_docker_load_diagnostics(ssh_base, image)
             fail(f"guest docker load failed with exit code {ssh_status}: {image}")
         guest_stdout.seek(0)
         load_output = guest_stdout.read().decode("utf-8", errors="replace")

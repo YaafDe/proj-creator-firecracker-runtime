@@ -22,6 +22,7 @@ jobs:
           bash -n rootfs/proj-creator-init
           python3 -m py_compile runner/firecracker-runner
           ./scripts/test-runner-docker-service.py
+          ./scripts/test-runner-docker-load-diagnostics.py
           grep -qF -- '["/bin/bash", "-l", container_path]' runner/firecracker-runner
           grep -q -- '/usr/bin/containerd' rootfs/proj-creator-init
           grep -q -- '--containerd=/run/containerd/containerd.sock' rootfs/proj-creator-init

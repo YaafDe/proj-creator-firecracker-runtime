@@ -193,6 +193,17 @@ path loads the selected agent image from the host Docker daemon with `docker
 save` / `docker load`, so the guest does not need registry access just to start
 the agent image.
 
+Large first-use imports emit a status update every 30 seconds and have a
+30-minute wall-clock bound. Override these with
+`PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_PROGRESS_SECONDS` and
+`PROJ_CREATOR_FIRECRACKER_DOCKER_LOAD_TIMEOUT_SECONDS` when validating unusual
+images. A failed or timed-out import records the host-export and guest-load
+process states, bounded stderr tails, and a redacted guest Docker, filesystem,
+memory, process, daemon-log, and kernel diagnostic snapshot. Diagnostic SSH is
+separately bounded by
+`PROJ_CREATOR_FIRECRACKER_DOCKER_DIAGNOSTIC_TIMEOUT_SECONDS` (30 seconds by
+default), so failure reporting cannot leave the executor occupied indefinitely.
+
 ## Security Rules
 
 Public release assets must not contain:
