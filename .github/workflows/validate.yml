@@ -26,6 +26,7 @@ jobs:
           grep -qF -- '["/bin/bash", "-l", container_path]' runner/firecracker-runner
           grep -q -- '/usr/bin/containerd' rootfs/proj-creator-init
           grep -q -- '--containerd=/run/containerd/containerd.sock' rootfs/proj-creator-init
+          grep -q -- '--storage-driver=overlay2' rootfs/proj-creator-init
           grep -q -- 'net.ipv4.ip_forward=1' rootfs/proj-creator-init
           grep -q -- '--iptables=true' rootfs/proj-creator-init
           grep -q -- '--ip-forward=true' rootfs/proj-creator-init
@@ -34,6 +35,7 @@ jobs:
           grep -q -- '--uid 10001 --gid 10001' rootfs/Dockerfile
           grep -q -- 'chown appuser:appuser /workspace' rootfs/Dockerfile
           grep -q 'VIRTIO_MMIO_CMDLINE_DEVICES' scripts/build-kernel.sh
+          grep -q 'OVERLAY_FS' scripts/build-kernel.sh
           grep -q 'IP_NF_RAW' scripts/build-kernel.sh
           ./scripts/smoke-runner.sh
           PROJ_CREATOR_FIRECRACKER_KERNEL_DRY_RUN=1 ./scripts/build-kernel.sh

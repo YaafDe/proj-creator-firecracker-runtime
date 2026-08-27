@@ -70,6 +70,11 @@ rootfs block device and network device, so release kernels must contain
 `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` and the built `vmlinux` must contain the
 `virtio_mmio.device` parser string.
 
+Release kernels also require built-in `CONFIG_OVERLAY_FS=y`, and the guest
+starts Docker with `overlay2` explicitly. Falling back to Docker's `vfs`
+driver copies complete parent layers during first-use imports and is not a
+supported runtime configuration.
+
 To pin or override the kernel source:
 
 ```bash

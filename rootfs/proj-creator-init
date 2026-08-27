@@ -45,6 +45,7 @@ if [ -x /usr/bin/dockerd ]; then
   /usr/bin/dockerd \
     --host=unix:///var/run/docker.sock \
     --containerd=/run/containerd/containerd.sock \
+    --storage-driver=overlay2 \
     --iptables=true \
     --ip-forward=true \
     --userland-proxy=false \
