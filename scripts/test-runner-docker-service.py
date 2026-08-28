@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import os
 import pathlib
 import signal
 import tempfile
@@ -370,19 +371,60 @@ class PreparedImageShutdownTests(unittest.TestCase):
         self.assertNotIn("poweroff", script)
 
     def test_large_guest_image_flush_has_a_separate_bounded_phase(self):
-        root_ssh_base = ["ssh", "root@guest"]
+        root_ssh_base = [
+            "ssh",
+            "-o",
+            "ServerAliveInterval=15",
+            "-oServerAliveCountMax=2",
+            "root@guest",
+        ]
 
-        with mock.patch.object(module, "emit_status") as emit_status, mock.patch.object(
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             module,
-            "run",
-        ) as run:
+            "emit_status",
+        ) as emit_status, mock.patch.object(module, "run") as run:
             module.flush_prepared_guest_filesystem(root_ssh_base)
 
         emit_status.assert_called_once_with(
             "setup",
             "Flushing prepared agent image filesystem",
         )
-        run.assert_called_once_with(["timeout", "180", *root_ssh_base, "sync"])
+        run.assert_called_once_with(
+            [
+                "timeout",
+                "900",
+                "ssh",
+                "-o",
+                "ServerAliveInterval=0",
+                "root@guest",
+                "sync",
+            ]
+        )
+
+    def test_large_guest_image_flush_timeout_is_configurable(self):
+        root_ssh_base = ["ssh", "root@guest"]
+
+        with mock.patch.dict(
+            os.environ,
+            {"PROJ_CREATOR_FIRECRACKER_PREPARED_SYNC_TIMEOUT_SECONDS": "1200"},
+            clear=True,
+        ), mock.patch.object(module, "emit_status"), mock.patch.object(
+            module,
+            "run",
+        ) as run:
+            module.flush_prepared_guest_filesystem(root_ssh_base)
+
+        run.assert_called_once_with(
+            [
+                "timeout",
+                "1200",
+                "ssh",
+                "-o",
+                "ServerAliveInterval=0",
+                "root@guest",
+                "sync",
+            ]
+        )
 
 
 class SshCommandTransportTests(unittest.TestCase):

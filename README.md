@@ -188,7 +188,11 @@ cache key, while the marker separately records the ID reported by the guest's
 config IDs during this transfer. Before clean shutdown and publication, the
 one-time preparation VM performs a separately bounded filesystem flush; this
 allows large imported layers to settle without coupling durability to the
-short reboot-command timeout. A missing or invalid snapshot falls back to
+short reboot-command timeout. The flush allows 15 minutes by default because
+slow executor storage can take several minutes to persist a multi-GiB image;
+override it with
+`PROJ_CREATOR_FIRECRACKER_PREPARED_SYNC_TIMEOUT_SECONDS` when validating an
+unusually slow host. A missing or invalid snapshot falls back to
 `docker save` / `docker load` and invalidates the marker.
 
 The runner expects the host to provide `docker`, `firecracker`, `ip`, `ssh`,

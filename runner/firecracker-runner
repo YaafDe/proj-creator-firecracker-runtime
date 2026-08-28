@@ -1062,8 +1062,13 @@ def flush_prepared_guest_filesystem(root_ssh_base):
     # docker load may return before the guest kernel has flushed several GiB of
     # layer data. Give that one-time flush its own bounded phase so the short
     # reboot transport timeout cannot kill the sync process halfway through.
+    timeout_seconds = max(1, int(os.environ.get(
+        "PROJ_CREATOR_FIRECRACKER_PREPARED_SYNC_TIMEOUT_SECONDS",
+        "900",
+    )))
     emit_status("setup", "Flushing prepared agent image filesystem")
-    run(["timeout", "180", *root_ssh_base, "sync"])
+    transfer_ssh_base = ssh_base_for_bounded_bulk_transfer(root_ssh_base)
+    run(["timeout", str(timeout_seconds), *transfer_ssh_base, "sync"])
 
 
 def prepare_agent_image_snapshot(
